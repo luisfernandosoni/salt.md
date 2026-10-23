@@ -98,10 +98,13 @@ Four gates. The first is at the door, the other three run before a tool.
 
 1. **The account.** A deactivated account is refused at `/mcp` itself, with
    `403`, whatever the token says.
-2. **Token scope.** A read-only token may call only the reading tools. A
-   writing call gets `this API token is read-only; "<tool>" requires a write
-   token`. For `revisions` and `comments`, the *action* decides: reading a
-   history is a read, restoring a revision is a write.
+2. **Token scope.** A read-only token may call only the reading tools:
+   `list`, `search`, `get_page`, `query_rows`, `get_collection`, `get_links`,
+   `whoami`, `get_workspace`, `get_permissions` and `get_import_status`. Every
+   other tool counts as a write, and a writing call gets `this API token is
+   read-only; "<tool>" requires a write token`. For `revisions` and
+   `comments`, the *action* decides: reading a history is a read, restoring a
+   revision is a write.
 3. **Workspace scope.** A token can be narrowed to particular workspaces. A page
    outside them reads as not found, including as the destination of a move.
    A workspace can also refuse agents entirely, or accept only OAuth ones (see

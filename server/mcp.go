@@ -92,6 +92,32 @@ func wrapWorkspaceRules(rules string) string {
 		"\n----- END WORKSPACE RULES -----"
 }
 
+// readTools are the agent tools a read-only token may call. Every other tool
+// in the catalogue writes, apart from the two that decide by their action
+// (revisions and comments, see mcpCall).
+//
+// The list used to name the WRITING tools instead, and a tool missing from it
+// reached read-only tokens unchecked: save_as_template was missing, and a
+// read-only token created templates with it. Named this way round, a tool
+// somebody forgets here is refused to a read-only token, which is a bug
+// report rather than a hole. TestReadOnlyTokenWritesNothing walks the whole
+// catalogue.
+var readTools = map[string]bool{
+	"list": true, "search": true, "get_page": true, "query_rows": true,
+	"get_collection": true, "get_links": true, "whoami": true,
+	"get_workspace": true, "get_permissions": true, "get_import_status": true,
+}
+
+// isMCPTool reports whether the catalogue has a tool of that name.
+func isMCPTool(name string) bool {
+	for _, t := range mcpTools {
+		if t["name"] == name {
+			return true
+		}
+	}
+	return false
+}
+
 var mcpTools = []map[string]any{
 	{
 		"name":        "list",
@@ -747,23 +773,11 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 		}
 	}
 
-	// Idempotency: a retried call with the same key returns the first result
-	// instead of creating a duplicate. Scoped per user+tool.
-	// Every writing tool MUST be listed here, or a read-only token may write
-	// with it. Two of the merged tools carry read AND write actions, so for them
-	// the ACTION decides — see below.
-	mutating := name == "create_page" || name == "write_content" || name == "update_page" ||
-		name == "set_trashed" || name == "upload_file" ||
-		name == "set_properties" || name == "create_database" ||
-		name == "duplicate_page" ||
-		name == "update_schema" || name == "set_view" || name == "delete_view" ||
-		name == "create_rows" ||
-		name == "delete_comment" ||
-		name == "set_sharing" ||
-		name == "workspace" || name == "embed_database" || name == "import_url" ||
-		name == "working_on" || name == "note" ||
-		// Workspace rules (W123): a proposal is inert, but it IS a write.
-		name == "propose_workspace_rules"
+	// Whether this call writes: every tool does unless readTools names it. Two
+	// of the merged tools carry read AND write actions, so for them the ACTION
+	// decides, below. The answer gates read-only tokens, the retry key and the
+	// activity log.
+	mutating := !readTools[name]
 	switch name {
 	case "revisions":
 		// Reading the history is a read; putting a page back is not.
@@ -785,8 +799,9 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 		}
 	}()
 
-	// A read-only API token may call only the read tools (Q12).
-	if mutating && u.TokenScope == "read" {
+	// A read-only API token may call only the read tools (Q12). A name that is
+	// no tool at all gets the plain answer below, not this one.
+	if mutating && u.TokenScope == "read" && isMCPTool(name) {
 		return "", fmt.Errorf("this API token is read-only; %q requires a write token", name)
 	}
 	idemKey := ""
