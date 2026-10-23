@@ -77,7 +77,10 @@ When a client asks to sign in, the browser lands on a screen headed
 - The client's name, as "*<name>* is asking to work in your account."
 - A warning that the name is a claim: "That name was chosen by whoever set up
   the connection. Only continue if you started this yourself."
-- **It will be allowed to**: "read and change pages" or "read pages".
+- **It will be allowed to**: "read pages" or "read and change pages", as a
+  choice. What the client asked for is selected to begin with; a client that
+  asked for nothing in particular starts on "read pages", and you can give it
+  more or less than it asked for.
 - **Where**: either "Every workspace, including ones added later" or "Only the
   ones I pick". The list underneath starts with nothing ticked, and **Allow**
   stays dead until you tick something.

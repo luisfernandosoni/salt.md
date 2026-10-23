@@ -33,12 +33,19 @@ export default function OAuthConsent() {
   const method = params.get('code_challenge_method') ?? '';
   const state = params.get('state') ?? '';
   const resource = params.get('resource') ?? '';
-  // Already narrowed by the server, which hands this screen a single value.
-  // Parsing the space-separated list a second time here is how two parsers end
-  // up disagreeing about what was granted.
-  const scope = params.get('scope') === 'write' ? 'write' : 'read';
+  // What the client asked for, already narrowed by the server to a single
+  // value. Parsing the space-separated list a second time here is how two
+  // parsers end up disagreeing about what was granted.
+  const asked = params.get('scope') === 'write' ? 'write' : 'read';
 
   const [info, setInfo] = useState<RequestInfo | null>(null);
+  // The request only sets the starting point; the person granting it decides.
+  // A client that asks for nothing in particular, which is what
+  // `claude mcp add --transport http` does, otherwise got read access with no
+  // way to say more short of editing the client's configuration (#83). The
+  // token answer names the scope that was granted (RFC 6749 §3.3), so the
+  // client learns it either way.
+  const [scope, setScope] = useState<'read' | 'write'>(asked);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   // "Everything, including whatever is made later" versus "these ones". The
   // difference is not convenience: a list of workspaces is a photograph of
@@ -127,7 +134,14 @@ export default function OAuthConsent() {
 
         <div className="consent-block">
           <div className="consent-block-head">{t('It will be allowed to')}</div>
-          <p>{scope === 'write' ? t('read and change pages') : t('read pages')}</p>
+          <label className="consent-ws">
+            <input type="radio" checked={scope === 'read'} onChange={() => setScope('read')} />
+            <span>{t('read pages')}</span>
+          </label>
+          <label className="consent-ws">
+            <input type="radio" checked={scope === 'write'} onChange={() => setScope('write')} />
+            <span>{t('read and change pages')}</span>
+          </label>
         </div>
 
         <div className="consent-block">

@@ -63,7 +63,7 @@ the network still works for an agent outside it.
 | --- | --- | --- |
 | The address | `https://salt.example.com/mcp` | `https://salt.example.com/mcp/<token>` |
 | What is secret | Nothing in the address | The address itself |
-| Who decides the reach | The client asks for read, or for read and write. You decide, on a consent screen, which workspaces it gets, and whether it gets anything at all. | Whoever creates the token, in advance: the scope and the workspaces both |
+| Who decides the reach | The client asks for read, or for read and write. You decide, on a consent screen, which of the two it gets, which workspaces, and whether it gets anything at all. | Whoever creates the token, in advance: the scope and the workspaces both |
 | Lifetime | An access token expires after an hour and is renewed in the background | Until it is revoked |
 | Ends by | Revoking the grant (see below, this one is unfinished) | **Revoke**, in the **API tokens** dialog |
 
@@ -83,10 +83,11 @@ The consent screen shows the instance name and host at the top, then:
   was chosen by whoever set up the connection*: anyone can register a client
   under any name, so the screen presents the name as a claim rather than as an
   identity.
-- **It will be allowed to**: *read pages*, or *read and change pages*. This half
-  is shown, not chosen. The client asked for it in the request that sent you
-  here, and there is no control to narrow it: your decision is whether to
-  approve what was asked.
+- **It will be allowed to**: *read pages*, or *read and change pages*. What the
+  client asked for is selected to begin with, and you can switch it either way.
+  Many clients ask for nothing in particular, Claude Code's
+  `claude mcp add --transport http` among them, and then *read pages* is
+  selected: pick *read and change pages* if the agent should write.
 - **Where**: **Every workspace, including ones added later**, or **Only the ones
   I pick**. Nothing is ticked to begin with, and **Allow** stays dead until you
   pick something. The difference is not convenience: a list of workspaces is a
