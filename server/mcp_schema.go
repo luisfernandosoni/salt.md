@@ -185,23 +185,54 @@ func (s *Server) saveCollection(pageID string, schema []map[string]any, views []
 
 // slugID turns a name into a stable, readable identifier. Readable ids help
 // the agent: "due-date" says more than "p7". On a collision it counts up. The
-// umlaut cases below spell German letters out, because an id carries none.
+// umlaut and accent cases below spell German and Latin letters out, because an
+// id carries none.
 func slugID(name string, taken map[string]bool) string {
 	var b strings.Builder
+	prevHyphen := true
 	for _, r := range strings.ToLower(name) {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
+			prevHyphen = false
 		case r == 'ä': // i18n-ok: German letter, spelled out below
 			b.WriteString("ae")
+			prevHyphen = false
 		case r == 'ö': // i18n-ok: German letter, spelled out below
 			b.WriteString("oe")
+			prevHyphen = false
 		case r == 'ü': // i18n-ok: German letter, spelled out below
 			b.WriteString("ue")
+			prevHyphen = false
 		case r == 'ß': // i18n-ok: German letter, spelled out below
 			b.WriteString("ss")
+			prevHyphen = false
+		case r == 'á' || r == 'à' || r == 'â' || r == 'ã': // i18n-ok: accented Latin letter, folded below
+			b.WriteRune('a')
+			prevHyphen = false
+		case r == 'é' || r == 'è' || r == 'ê' || r == 'ë': // i18n-ok: accented Latin letter, folded below
+			b.WriteRune('e')
+			prevHyphen = false
+		case r == 'í' || r == 'ì' || r == 'î' || r == 'ï': // i18n-ok: accented Latin letter, folded below
+			b.WriteRune('i')
+			prevHyphen = false
+		case r == 'ó' || r == 'ò' || r == 'ô' || r == 'õ': // i18n-ok: accented Latin letter, folded below
+			b.WriteRune('o')
+			prevHyphen = false
+		case r == 'ú' || r == 'ù' || r == 'û': // i18n-ok: accented Latin letter, folded below
+			b.WriteRune('u')
+			prevHyphen = false
+		case r == 'ñ': // i18n-ok: Spanish letter, folded below
+			b.WriteRune('n')
+			prevHyphen = false
+		case r == 'ç': // i18n-ok: accented Latin letter, folded below
+			b.WriteRune('c')
+			prevHyphen = false
 		case r == ' ' || r == '-' || r == '_':
-			b.WriteRune('-')
+			if !prevHyphen {
+				b.WriteRune('-')
+				prevHyphen = true
+			}
 		}
 	}
 	base := strings.Trim(b.String(), "-")
@@ -213,6 +244,73 @@ func slugID(name string, taken map[string]bool) string {
 		id = fmt.Sprintf("%s-%d", base, i)
 	}
 	return id
+}
+
+// mergeExistingOptions keeps the stored id and color of options that already
+// exist under the same name, so an agent re-sending ["En Revisión", "Listo"]
+// to add a third option never orphans rows or wipes custom colors.
+func mergeExistingOptions(existingRaw any, incomingRaw any) any {
+	existingList, ok1 := existingRaw.([]any)
+	incomingList, ok2 := incomingRaw.([]any)
+	if !ok1 || !ok2 {
+		return incomingRaw
+	}
+	byName := map[string]map[string]any{}
+	byID := map[string]map[string]any{}
+	taken := map[string]bool{}
+	for _, item := range existingList {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		id, _ := m["id"].(string)
+		if name != "" {
+			byName[name] = m
+		}
+		if id != "" {
+			byID[id] = m
+			taken[id] = true
+		}
+	}
+	out := make([]any, 0, len(incomingList))
+	for _, item := range incomingList {
+		m, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		name, _ := m["name"].(string)
+		id, _ := m["id"].(string)
+		if prev, found := byID[id]; found {
+			if _, hasColor := m["color"]; !hasColor {
+				if c, ok := prev["color"]; ok {
+					m["color"] = c
+				}
+			}
+			out = append(out, m)
+			continue
+		}
+		if prev, found := byName[name]; found {
+			if prevID, ok := prev["id"].(string); ok && prevID != "" {
+				m["id"] = prevID
+			}
+			if _, hasColor := m["color"]; !hasColor {
+				if c, ok := prev["color"]; ok {
+					m["color"] = c
+				}
+			}
+			out = append(out, m)
+			continue
+		}
+		if id != "" && taken[id] {
+			id = slugID(name, taken)
+			m["id"] = id
+		}
+		taken[id] = true
+		out = append(out, m)
+	}
+	return out
 }
 
 // --- Schema ----------------------------------------------------------------
@@ -278,6 +376,9 @@ func (s *Server) mcpUpdateSchema(pageID string, props json.RawMessage, remove []
 			for k, v := range in {
 				if k == "id" {
 					continue
+				}
+				if k == "options" {
+					v = mergeExistingOptions(schema[idx]["options"], v)
 				}
 				schema[idx][k] = v
 			}
