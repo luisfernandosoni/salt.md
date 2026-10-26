@@ -578,12 +578,22 @@
   --bn-border-radius: var(--radius);
 }
 
+/* The formatting toolbar gets the same look without the blur. A backdrop
+   filter makes the element it sits on the containing block of its absolutely
+   positioned children, and the toolbar's lists (block type, colour) are such
+   children, inside a box BlockNote lets scroll sideways on a narrow screen:
+   the open list was cut off at the toolbar's 34 px edge and could not be seen
+   (#94). Behind a background this opaque the blur showed nothing anyway. */
 .bn-root .bn-suggestion-menu,
-.bn-root .bn-toolbar,
 .bn-root .mantine-Menu-dropdown,
 .bn-root .mantine-Popover-dropdown {
   -webkit-backdrop-filter: blur(18px) saturate(150%);
   backdrop-filter: blur(18px) saturate(150%);
+}
+.bn-root .bn-suggestion-menu,
+.bn-root .bn-toolbar,
+.bn-root .mantine-Menu-dropdown,
+.bn-root .mantine-Popover-dropdown {
   border: none;
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
