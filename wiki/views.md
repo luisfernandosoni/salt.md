@@ -337,7 +337,7 @@ What they mean:
 
 | Operator | Matches |
 | --- | --- |
-| `is` | equal to the value, or, on a list property, containing it |
+| `is` | equal to the value, or, on a list property, containing it. A number compares as a number, so 5 and 5.0 are equal, and on a checkbox **Unchecked** includes a box nobody ever touched. |
 | `is_not` | not equal, **and an empty value counts as "is not X"** |
 | `is_empty` | nothing there: no value, an empty text, an empty list |
 | `is_not_empty` | anything there |

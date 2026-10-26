@@ -156,6 +156,35 @@ type rowFilter struct {
 	Prop, Op, Value string
 	Values          []string
 	Value2          string
+	// Kind is the property's type where where() has to compare differently,
+	// "number" or "checkbox", and empty otherwise. Set per query by
+	// typeFilters, because where() has no schema.
+	Kind string
+}
+
+// typeFilters tells each condition what kind of property it is on, where
+// that changes the comparison. A number is stored as a JSON number and a
+// ticked box as JSON true, and comparing either with the filter's text
+// matched nothing: "Qty is 5" and "Done is Checked" found no rows (#95).
+func (s *Server) typeFilters(collectionID string, filters []rowFilter) []rowFilter {
+	schema, _, err := s.loadCollection(collectionID)
+	if err != nil {
+		return filters
+	}
+	kinds := map[string]string{}
+	for _, p := range schema {
+		id, _ := p["id"].(string)
+		switch t, _ := p["type"].(string); t {
+		case "number", "checkbox":
+			kinds[id] = t
+		}
+	}
+	out := make([]rowFilter, len(filters))
+	for i, f := range filters {
+		f.Kind = kinds[f.Prop]
+		out[i] = f
+	}
+	return out
 }
 
 // vals is what the condition actually compares against: the set if there is one,
@@ -252,6 +281,11 @@ func (f rowFilter) where() (string, []any) {
 	for i, v := range vals {
 		anyOf[i] = v
 	}
+	if op == "is" || op == "is_not" {
+		if cond, args, ok := f.typedIs(ex, op, vals); ok {
+			return cond, args
+		}
+	}
 	// The value may be stored as a scalar or inside a list (multiselect, a
 	// relation): both spellings have to answer the same question.
 	inList := "EXISTS (SELECT 1 FROM json_each(props, '$." + f.Prop + "') WHERE value IN (" + holders + "))"
@@ -291,6 +325,68 @@ func (f rowFilter) where() (string, []any) {
 	return "", nil
 }
 
+// typedIs is "is" and "is not" on a number or a checkbox, compared the way the
+// browser compares them in its second pass (matchesFilter). ok is false where
+// the plain text comparison applies.
+//
+// A number matches as a number, so 5 and 5.0 are one value, and still as text,
+// because a number written as text through the API ("5") always matched.
+// A box matches ticked when it holds JSON true; a box nobody touched has no
+// value at all and counts as unticked, as it does on screen.
+func (f rowFilter) typedIs(ex, op string, vals []string) (string, []any, bool) {
+	var cond string
+	var args []any
+	switch f.Kind {
+	case "number":
+		var nums, texts []any
+		for _, v := range vals {
+			if n, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+				nums = append(nums, n)
+				texts = append(texts, v)
+			}
+		}
+		if len(nums) == 0 {
+			return "", nil, false
+		}
+		holders := strings.TrimSuffix(strings.Repeat("?, ", len(nums)), ", ")
+		cond = "(" + ex + " IN (" + holders + ") OR " + ex + " IN (" + holders + "))"
+		args = append(nums, texts...)
+		if op == "is_not" {
+			return "(" + ex + " IS NULL OR NOT " + cond + ")", args, true
+		}
+		return cond, args, true
+	case "checkbox":
+		var ticked, unticked bool
+		for _, v := range vals {
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "true":
+				ticked = true
+			case "false":
+				unticked = true
+			}
+		}
+		if !ticked && !unticked {
+			return "", nil, false
+		}
+		// COALESCE, because a missing value makes json_type NULL, and NOT NULL
+		// is NULL too: the untouched box would drop out of "is Unchecked".
+		isTicked := "COALESCE(json_type(props, '$." + f.Prop + "'), '') = 'true'"
+		switch {
+		case ticked && unticked:
+			cond = "1 = 1"
+		case ticked:
+			cond = isTicked
+		default:
+			cond = "NOT " + isTicked
+		}
+		if op == "is_not" {
+			return "NOT (" + cond + ")", nil, true
+		}
+		return cond, nil, true
+	}
+	return "", nil, false
+}
+
 // collectionRowsQuery filters, sorts and paginates a collection's rows in
 // SQLite and injects computed (rollup/formula/relation) values. Shared by the
 // REST handler and the MCP query_rows tool so both behave identically.
@@ -310,10 +406,10 @@ func (s *Server) collectionRowsQuery(u *user, colID string, flat []rowFilter, gr
 	// A relative day names a different date every day. Resolve it now, per
 	// query, so a saved view stays live, and only on date properties (see
 	// resolveSmartDates), so a status option named "Today" keeps working.
-	flat = s.resolveSmartDates(colID, flat, now)
+	flat = s.typeFilters(colID, s.resolveSmartDates(colID, flat, now))
 	resolved := make([][]rowFilter, len(groups))
 	for i, g := range groups {
-		resolved[i] = s.resolveSmartDates(colID, g, now)
+		resolved[i] = s.typeFilters(colID, s.resolveSmartDates(colID, g, now))
 	}
 	groups = resolved
 	where := []string{"parent_id = ?", "trashed_at IS NULL"}

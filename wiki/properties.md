@@ -122,9 +122,8 @@ defaults to 100. A bar or a ring shows the figure beside it and turns back into
 a plain input when you click it. Its tooltip reads the value and the maximum,
 which is the only place the configured Max can be seen while reading.
 
-**Filters** with is, is not, >, <, is empty, is not empty, but use > and <
-rather than an exact is, which matches nothing (see
-[Filtering](#filtering-sorting-and-hiding)). **Sorts** numerically. In a table
+**Filters** with is, is not, >, <, is empty, is not empty. "Is" compares as a
+number, so 5 and 5.0 are the same value. **Sorts** numerically. In a table
 the column footer shows the sum of the column, marked with a Σ.
 
 **On a board card** it is a labelled fact: the property name, then the value. A
@@ -221,9 +220,8 @@ dropped as noise. The same goes for a lone number called "Number" or `Zahl`.
 True or false. The cell is a checkbox; click it.
 
 **Filters** with is, is not, is empty, is not empty, and the value is offered as
-**Checked** or **Unchecked**, though "is" matches nothing either way (see
-[Filtering](#filtering-sorting-and-hiding)), so narrow with "is not" instead:
-"is not Checked" gives you the unfinished rows.
+**Checked** or **Unchecked**. A box nobody ever touched counts as unchecked, so
+"is Unchecked" gives you the unfinished rows.
 
 **In a view, "is not empty" returns only the ticked boxes.** A box that was
 explicitly unticked counts as empty there. Over `query_rows` the same condition
@@ -525,12 +523,6 @@ columns.
   a dropdown of options for a select, a dropdown of row titles for a relation or
   a backrelation, Checked/Unchecked for a checkbox, a text box for everything
   else.
-
-  **One operator has a blind spot.** Rows are selected in the database, where an
-  "is" compares the stored value against text. That is exactly right for a
-  select, a date, a relation or a text property, and it matches nothing at all
-  for a number or a checkbox, whose values are stored as a number and a boolean.
-  Use ">" and "<" on a number, and "is not" on a checkbox; both work.
 - **Sort** takes one property and a direction, **Ascending** or **Descending**.
   **No sort** at the top of the property list clears it again. Numbers compare
   as numbers; everything else compares the way the active language sorts,

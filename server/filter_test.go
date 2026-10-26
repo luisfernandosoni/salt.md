@@ -211,3 +211,55 @@ func TestParseFilterGroups(t *testing.T) {
 		t.Errorf("second group is %#v, want the datum range", groups[1])
 	}
 }
+
+// "is" and "is not" on a number or a checkbox (#95). A number is stored as a
+// JSON number and a ticked box as JSON true, and comparing either with the
+// filter's text matched nothing, while the browser's own pass matched them.
+func TestFilterIsOnNumbersAndCheckboxes(t *testing.T) {
+	s := testServer(t)
+	_, _ = signedIn(t, s, "typed@example.com")
+	var ws string
+	if err := s.db.QueryRow(`SELECT id FROM workspaces LIMIT 1`).Scan(&ws); err != nil {
+		t.Fatal(err)
+	}
+	col := newID()
+	if _, err := s.db.Exec(`INSERT INTO pages (id, parent_id, workspace_id, title, type, props, created_at, updated_at)
+		VALUES (?, NULL, ?, 'Stock', 'collection', '{}', ?, ?)`, col, ws, now(), now()); err != nil {
+		t.Fatal(err)
+	}
+	schema := `[{"id":"qty","name":"Qty","type":"number"},{"id":"ok","name":"Done","type":"checkbox"}]`
+	if _, err := s.db.Exec(`INSERT INTO collections (page_id, schema, views) VALUES (?, ?, '[]')`, col, schema); err != nil {
+		t.Fatal(err)
+	}
+	// Five rows: 5 ticked, 5.0 unticked, "5" as text and never touched, 7
+	// ticked, and one with nothing at all.
+	for i, props := range []string{`{"qty":5,"ok":true}`, `{"qty":5.0,"ok":false}`, `{"qty":"5"}`, `{"qty":7,"ok":true}`, `{}`} {
+		if _, err := s.db.Exec(`INSERT INTO pages (id, parent_id, workspace_id, title, type, props, position, created_at, updated_at)
+			VALUES (?, ?, ?, 'Item', 'row', ?, ?, ?, ?)`, newID(), col, ws, props, i, now(), now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		f    rowFilter
+		want int
+	}{
+		{rowFilter{Prop: "qty", Op: "is", Value: "5"}, 3},
+		{rowFilter{Prop: "qty", Value: "5"}, 3},
+		{rowFilter{Prop: "qty", Op: "is", Values: []string{"5", "7"}}, 4},
+		{rowFilter{Prop: "qty", Op: "is_not", Value: "5"}, 2},
+		{rowFilter{Prop: "qty", Op: "gt", Value: "4"}, 4},
+		{rowFilter{Prop: "ok", Op: "is", Value: "true"}, 2},
+		{rowFilter{Prop: "ok", Op: "is", Value: "false"}, 3},
+		{rowFilter{Prop: "ok", Op: "is_not", Value: "true"}, 3},
+		{rowFilter{Prop: "ok", Op: "is_not", Value: "false"}, 2},
+		{rowFilter{Prop: "ok", Op: "is", Values: []string{"true", "false"}}, 5},
+	} {
+		if n := count(t, s, col, c.f); n != c.want {
+			t.Errorf("%+v matched %d rows, want %d", c.f, n, c.want)
+		}
+	}
+	// The flat list takes the same path as the groups.
+	if _, total, err := s.collectionRowsQuery(&user{ID: "u"}, col, []rowFilter{{Prop: "ok", Op: "is", Value: "true"}}, nil, "", 100, 0, time.Time{}); err != nil || total != 2 {
+		t.Errorf("flat ok is true: %d rows, %v; want 2", total, err)
+	}
+}
