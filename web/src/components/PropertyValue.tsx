@@ -801,7 +801,7 @@ function RelationValue({ def, value, onChange, readOnly, compact, maxChips }: Pr
     onChange!(ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]);
   };
   const filtered = options.filter((o) =>
-    (o.title || 'Untitled').toLowerCase().includes(query.toLowerCase()),
+    (o.title || t('Untitled')).toLowerCase().includes(query.toLowerCase()),
   );
 
   return (
@@ -840,7 +840,7 @@ function RelationValue({ def, value, onChange, readOnly, compact, maxChips }: Pr
                     <PageIcon icon={o.icon} size={16} />
                   </span>
                 )}
-                {o.title || 'Untitled'}
+                {o.title || t('Untitled')}
               </button>
             ))}
           </div>

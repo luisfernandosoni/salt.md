@@ -531,7 +531,10 @@ export default function CollectionView({ collectionId, pages, tagColors, onNavig
     // Deliberately does NOT onNavigate() into the new row: creating an item
     // from a collection view should keep you looking at the collection, same
     // as Notion. Opening it is the same click as any other existing row.
-    await api.createPage(collectionId, 'Untitled', 'doc', presetProps);
+    // No title, like a page made anywhere else: the word "Untitled" is what the
+    // interface shows for that, in the reader's language. Stored, it stayed
+    // English in every language and turned up in search and exports.
+    await api.createPage(collectionId, '', 'doc', presetProps);
     onPagesChanged();
   };
 
@@ -2033,7 +2036,7 @@ function BoardView({
                   (drag?.rowId === r.id && drag.fromCol === col.id ? ' is-dragging' : '') +
                   (armedRow === r.id ? ' is-armed' : '')
                 }
-                onPointerDown={(e) => startDrag(e, r.id, col.id, r.title || 'Untitled')}
+                onPointerDown={(e) => startDrag(e, r.id, col.id, r.title || t('Untitled'))}
                 onClick={(e) => {
                   // Do NOT open after a drag — otherwise every move jumps
                   // straight into the card.
@@ -2053,7 +2056,7 @@ function BoardView({
                 <div className="board-card-top">
                   <div className="board-card-title">
                     {r.icon && <span className="inline-icon"><PageIcon icon={r.icon} size={14} /> </span>}
-                    {r.title || 'Untitled'}
+                    {r.title || t('Untitled')}
                   </div>
                   {/* OUTSIDE the title: it clamps to four lines, and anything
                       inside a clamped box is part of the text flow — the mark
@@ -2416,7 +2419,7 @@ function TableView({
                     onAuxClick={(e) => openPageAux(e, r.id, { onNavigate, onOpenInNewTab })}
                   >
                     {r.icon && <span className="inline-icon"><PageIcon icon={r.icon} size={14} /> </span>}
-                    {r.title || 'Untitled'}
+                    {r.title || t('Untitled')}
                   </button>
                   {/* Presence was drawn on the board card and nowhere else, so
                       anybody working in the table saw nothing at all — which is
@@ -2685,7 +2688,7 @@ function TimelineView({
                         <PageIcon icon={row.icon} size={14} />
                       </span>
                     )}
-                    <span className="tl-label-text">{row.title || 'Untitled'}</span>
+                    <span className="tl-label-text">{row.title || t('Untitled')}</span>
                   </div>
                   <div className="tl-track" style={{ width: gridWidth }}>
                     <div className="tl-today-line" style={{ left: todayLeft }} />
@@ -2696,7 +2699,7 @@ function TimelineView({
                       onAuxClick={(e) => openPageAux(e, row.id, { onNavigate, onOpenInNewTab })}
                       title={row.title}
                     >
-                      <span className="tl-bar-label">{row.title || 'Untitled'}</span>
+                      <span className="tl-bar-label">{row.title || t('Untitled')}</span>
                     </div>
                   </div>
                 </div>
@@ -2788,7 +2791,7 @@ function CalendarView({
                   title={r.title}
                 >
                   {r.icon && <span className="inline-icon"><PageIcon icon={r.icon} size={14} /> </span>}
-                  {r.title || 'Untitled'}
+                  {r.title || t('Untitled')}
                   {!!r.tags?.length && (
                     <span className="cal-event-tags">
                       {r.tags.map((t) => (

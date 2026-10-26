@@ -895,7 +895,7 @@ function PageHeader({
               <button className="crumb" onClick={() => onNavigate(b.id)}>
                 {(() => {
                   const ic = b.id === pageId ? icon : b.icon;
-                  const tt = (b.id === pageId ? title : b.title) || 'Untitled';
+                  const tt = (b.id === pageId ? title : b.title) || t('Untitled');
                   return (
                     <>
                       {ic && (
@@ -1819,11 +1819,11 @@ function BlockContent({
     const q = query.toLowerCase();
     const matches = [...pagesById.values()]
       .filter((p) => !p.trashed && p.id !== provider.pageId)
-      .filter((p) => (p.title || 'Untitled').toLowerCase().includes(q))
+      .filter((p) => (p.title || t('Untitled')).toLowerCase().includes(q))
       .slice(0, 12);
     const items = matches.map((p) => ({
-      title: p.title || 'Untitled',
-      subtext: p.type === 'collection' ? 'Database' : 'Page',
+      title: p.title || t('Untitled'),
+      subtext: p.type === 'collection' ? t('Collection') : t('Page'),
       onItemClick: () =>
         editor.insertInlineContent([
           { type: 'pageLink', props: { pageId: p.id, label: p.title || 'Untitled' } },
@@ -2158,7 +2158,7 @@ function Backlinks({
       {links.map((l) => (
         <button key={l.id} className="backlink-item" onClick={() => onNavigate(l.id)}>
           <span className="tree-icon"><PageIcon icon={l.icon} size={14} fallback={<FileText size={14} />} /></span>
-          {l.title || 'Untitled'}
+          {l.title || t('Untitled')}
         </button>
       ))}
     </div>

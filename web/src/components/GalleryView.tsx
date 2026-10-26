@@ -3,6 +3,7 @@ import PropertyValue from './PropertyValue';
 import { tagColorClass } from '../tags';
 import { PageIcon } from '../pageIcon';
 import { openCollectionRow, openPageAux } from '../pageOpen';
+import { t } from '../i18n';
 
 interface Row {
   id: string;
@@ -53,13 +54,13 @@ export default function GalleryView({
           <div className="gallery-body">
             <div className="gallery-title">
               {r.icon && r.cover ? <span className="inline-icon"><PageIcon icon={r.icon} size={14} /> </span> : null}
-              {r.title || 'Untitled'}
+              {r.title || t('Untitled')}
             </div>
             {!!r.tags?.length && (
               <div className="db-row-tags card-tags">
-                {r.tags.map((t) => (
-                  <span key={t} className={'row-tag ' + tagColorClass(t, tagColors)}>
-                    #{t}
+                {r.tags.map((tag) => (
+                  <span key={tag} className={'row-tag ' + tagColorClass(tag, tagColors)}>
+                    #{tag}
                   </span>
                 ))}
               </div>

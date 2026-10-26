@@ -124,8 +124,8 @@ menu:
 | **Move to trash** | Asks *Move “…” to the trash?* with the row's title first, then moves the row to the trash. Reversible from [Trash](trash-and-recovery.md). |
 
 At the bottom of every column is **＋ New**, which creates a row with that
-column's value already set and opens it. Under the catch-all column it creates a
-plain row with nothing set.
+column's value already set. The card appears in the column; a click opens it.
+Under the catch-all column it creates a plain row with nothing set.
 
 **What a card shows** is decided by role, not by schema order, so cards look
 alike no matter how the schema grew: coloured chips first (select, multi-select,
@@ -304,7 +304,7 @@ configures the current view sits on the right, in this order:
 | **Columns** | Which properties this view shows. Shows `Columns (4/7)` when anything is hidden. |
 | **Properties** | The schema editor: add a property, change a type, edit select options. It edits the collection, not the view, so it changes every view at once. This is the **⚙ Properties** the empty-state messages point at. |
 | **⋯** (*View options*) | Rename, move and remove this view. |
-| **＋ New** | Creates an *Untitled* row and opens it. Every view except a form has it. |
+| **＋ New** | Creates an *Untitled* row and keeps you in the view; a click opens it. Every view except a form has it. |
 
 **Filter**, **Sort**, **Group** and **Columns** light up in the accent colour as
 soon as anything is set, so you can see that a view is filtered without opening

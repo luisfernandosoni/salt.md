@@ -146,7 +146,7 @@ export default function IndexView({
       }
     });
     const list = shelf
-      .filter((p) => (p.title || 'Untitled').toLowerCase().includes(q))
+      .filter((p) => (p.title || t('Untitled')).toLowerCase().includes(q))
       .map((p) => ({
         page: p,
         out: outCount.get(p.id) ?? 0,
@@ -172,7 +172,7 @@ export default function IndexView({
           return bv < av ? -1 : bv > av ? 1 : 0;
         }
         default:
-          return compare(a.page.title || 'Untitled', b.page.title || 'Untitled');
+          return compare(a.page.title || t('Untitled'), b.page.title || t('Untitled'));
       }
     });
     return list;
@@ -225,7 +225,7 @@ export default function IndexView({
     for (const p of childrenMap.get(key) ?? []) {
       const before = treeRows.length;
       const descendantMatch = renderSubtree(p.id, depth + 1);
-      const matches = (p.title || 'Untitled').toLowerCase().includes(q);
+      const matches = (p.title || t('Untitled')).toLowerCase().includes(q);
       if (query && !matches && !descendantMatch) {
         // Drop any descendant rows we tentatively rendered for a non-matching branch.
         treeRows.length = before;
@@ -243,7 +243,7 @@ export default function IndexView({
             title={p.id}
           >
             <span className="idx-node-icon"><PageIcon icon={p.icon} size={14} fallback={isDb ? '🗄' : '📄'} /></span>
-            <span className={'idx-node-title' + (query && matches ? ' idx-hit' : '')}>{p.title || 'Untitled'}</span>
+            <span className={'idx-node-title' + (query && matches ? ' idx-hit' : '')}>{p.title || t('Untitled')}</span>
             {isDb && <span className="index-badge" title={t('Collection')}><Table2 size={11} /></span>}
           </button>
           <code className="idx-node-id">{p.id.slice(0, 8)}</code>

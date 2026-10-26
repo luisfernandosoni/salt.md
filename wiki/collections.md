@@ -82,8 +82,9 @@ Two things about that call are easy to get wrong:
 
 ## Rows are pages
 
-**New** in the toolbar creates a row called *Untitled* and opens it immediately.
-On a board, the **＋ New** at the foot of a column does the same and presets the
+**New** in the toolbar creates a row without a title, shown as *Untitled*. You
+stay in the collection, and the row opens with a click like any other. On a
+board, the **＋ New** at the foot of a column does the same and presets the
 grouping property to that column's value, so a card added under *In progress*
 arrives in progress.
 
@@ -143,7 +144,7 @@ right, the settings for the view you are on.
 | **Columns** | Show and hide properties. Two lists, **Shown** and **Hidden**, with **Hide all** and **Show all**. The button reads **Columns**, and `Columns (4/7)` once something is hidden. |
 | **Properties** | Opens the schema dialog (see below). |
 | `⋯` (View options) | **Rename view**, **Move left**, **Move right**, **Remove view**. The arrows grey out at the ends; with only one view left the menu offers nothing but **Rename view**. |
-| **New** | Creates a row and opens it. |
+| **New** | Creates a row. The view stays as it is; a click opens the row. |
 
 On a **form** view the bar keeps only **Columns**, **Properties** and the `⋯`.
 There is nothing to filter, sort or add by hand there, and hiding a property

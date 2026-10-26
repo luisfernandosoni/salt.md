@@ -1,6 +1,7 @@
 import { BlockNoteSchema, defaultBlockSpecs, defaultInlineContentSpecs } from '@blocknote/core';
 import { createReactInlineContentSpec } from '@blocknote/react';
 import { bookmarkSpec, databaseSpec, calloutSpec, tocSpec, subpagesSpec, columnsSpec, mermaidSpec } from './blocks';
+import { t } from './i18n';
 
 // A "pageLink" is an inline mention of another salt.md page. It stores the target
 // page id and a display label. Clicking it dispatches a navigation event that
@@ -27,7 +28,7 @@ export const pageLinkSpec = createReactInlineContentSpec(
         }
       >
         <span className="page-link-icon">🔗</span>
-        {props.inlineContent.props.label || 'Untitled'}
+        {props.inlineContent.props.label || t('Untitled')}
       </button>
     ),
   },

@@ -279,7 +279,7 @@ export default function SchemaEditor({
             <option value="">{t('Select a collection…')}</option>
             {targets.map((c) => (
               <option key={c.id} value={c.id}>
-                {c.title || 'Untitled'}
+                {c.title || t('Untitled')}
               </option>
             ))}
           </select>
