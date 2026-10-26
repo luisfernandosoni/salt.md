@@ -261,6 +261,19 @@ func mdToBlocks(md string) []*mBlock {
 			appendBlock(&mBlock{Type: "image", Props: map[string]any{"url": m[2], "name": m[1]}}, 0)
 			continue
 		}
+		// Export writes an embedded database as `[Collection](/p/<id>)` on its
+		// own line (see export.go). Turning that back into a database block
+		// keeps an embedded collection from becoming an inline link when a page
+		// is read with get_page and written back with write_content, and lets an
+		// agent place an embedded collection between sections in Markdown.
+		if rtrimmed := strings.TrimSpace(trimmed); strings.HasPrefix(rtrimmed, "[Collection](") {
+			if m := linkRe.FindStringSubmatch(rtrimmed); m != nil && m[0] == rtrimmed && m[1] == "Collection" {
+				if pm := pageHrefRe.FindStringSubmatch(strings.TrimSpace(m[2])); pm != nil {
+					appendBlock(&mBlock{Type: "database", Props: map[string]any{"collectionId": pm[1]}}, 0)
+					continue
+				}
+			}
+		}
 		if m := checkRe.FindStringSubmatch(trimmed); m != nil {
 			checked := m[1] != " "
 			appendBlock(&mBlock{Type: "checkListItem", Props: map[string]any{"checked": checked},

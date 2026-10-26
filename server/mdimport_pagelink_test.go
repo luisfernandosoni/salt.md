@@ -95,3 +95,41 @@ func TestPageLinkSurvivesAMarkdownRoundTrip(t *testing.T) {
 		t.Errorf("the link did not survive the round trip: %v", links)
 	}
 }
+
+// Export writes an embedded database block as `[Collection](/p/<id>)` on its
+// own line (export.go). Importing that back has to restore the database block
+// rather than downgrading it to a paragraph with an inline pageLink, or any
+// get_page -> write_content(mode: "replace") pass destroys every embedded
+// collection on the page.
+func TestEmbeddedDatabaseSurvivesAMarkdownRoundTrip(t *testing.T) {
+	const dbID = "6430997b50672ea702cab5f43a31794c"
+	initial := `[{"type":"heading","props":{"level":2},"content":[{"type":"text","text":"Tasks","styles":{}}]},{"type":"database","props":{"collectionId":"` + dbID + `"}}]`
+
+	md := blocksToMarkdown([]byte(initial))
+	if !strings.Contains(md, "[Collection](/p/"+dbID+")") {
+		t.Fatalf("export did not emit [Collection](/p/id):\n%s", md)
+	}
+
+	roundTripped, err := mdToBlocksJSON(md)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if got := embeddedCollectionIDs(roundTripped); len(got) != 1 || got[0] != dbID {
+		t.Fatalf("embedded database lost on round trip (got %v):\n%s", got, roundTripped)
+	}
+	if len(extractLinks([]byte(roundTripped))) != 0 {
+		t.Errorf("embedded database was also turned into an inline pageLink:\n%s", roundTripped)
+	}
+
+	// A link inside a sentence or with any other label stays an inline pageLink.
+	inline, err := mdToBlocksJSON("See [Collection](/p/" + dbID + ") and\n\n[Tasks](/p/" + dbID + ")")
+	if err != nil {
+		t.Fatalf("inline import: %v", err)
+	}
+	if got := embeddedCollectionIDs(inline); len(got) != 0 {
+		t.Errorf("inline or differently labelled link became a database block: %v", got)
+	}
+	if links := extractLinks([]byte(inline)); len(links) != 1 || links[0] != dbID {
+		t.Errorf("inline links not preserved as pageLinks: %v", links)
+	}
+}
