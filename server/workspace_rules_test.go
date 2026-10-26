@@ -391,3 +391,36 @@ func TestProposalHiddenFromMembers(t *testing.T) {
 		t.Errorf("member list leaks the proposal: %s", body)
 	}
 }
+
+func TestProposeRulesNotifiesSubscribers(t *testing.T) {
+	s := testServer(t)
+	admin, _ := signedIn(t, s, "a@example.com")
+	ws := makeWorkspace(t, s, admin)
+
+	ch := s.events.subscribe(admin)
+	defer s.events.unsubscribe(ch)
+
+	if _, err := s.mcpProposeWorkspaceRules(&user{ID: admin}, ws, "Draft one"); err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		if !strings.Contains(ev, `"pages"`) {
+			t.Errorf("propose event = %q, want pages notification", ev)
+		}
+	default:
+		t.Error("propose_workspace_rules emitted no SSE event")
+	}
+
+	if _, err := s.mcpProposeWorkspaceRules(&user{ID: admin}, ws, ""); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		if !strings.Contains(ev, `"pages"`) {
+			t.Errorf("withdraw event = %q, want pages notification", ev)
+		}
+	default:
+		t.Error("withdrawing rules proposal emitted no SSE event")
+	}
+}

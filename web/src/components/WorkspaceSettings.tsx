@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../api';
 import type { Workspace } from '../types';
 import Portal from './Portal';
@@ -63,6 +63,11 @@ export default function WorkspaceSettings({
 }: Props) {
   useExclusiveModal(onClose);
   const [busy, setBusy] = useState(false);
+  // Refresh workspace metadata on open so a rules proposal submitted by an
+  // agent over MCP while this tab was already open shows up without a reload.
+  useEffect(() => {
+    onChanged();
+  }, [onChanged]);
   // Empty means the default, everywhere: no third state to handle, and an
   // instance that never touched these reads as today's behaviour.
   const access = ws.agentAccess || 'open';

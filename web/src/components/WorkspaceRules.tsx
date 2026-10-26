@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../api';
 import Portal from './Portal';
 import { useExclusiveModal } from '../modal';
@@ -36,6 +36,9 @@ export default function WorkspaceRules({
   const [proposal, setProposal] = useState(initialProposal);
   const [saving, setSaving] = useState(false);
   useExclusiveModal(onClose);
+  useEffect(() => {
+    setProposal(initialProposal);
+  }, [initialProposal]);
 
   const save = async () => {
     setSaving(true);

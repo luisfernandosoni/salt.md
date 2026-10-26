@@ -267,6 +267,7 @@ func (s *Server) mcpProposeWorkspaceRules(u *user, wsID, rules string) (string, 
 		if _, err := s.db.Exec(`UPDATE workspaces SET rules_proposal = '', rules_proposal_by = '', rules_proposal_at = '' WHERE id = ?`, wsID); err != nil {
 			return "", err
 		}
+		s.pagesChanged()
 		return "Withdrew your pending rules proposal.", nil
 	}
 	var replaced string
@@ -275,6 +276,7 @@ func (s *Server) mcpProposeWorkspaceRules(u *user, wsID, rules string) (string, 
 		rules, u.ID, now(), wsID); err != nil {
 		return "", err
 	}
+	s.pagesChanged()
 	note := "Proposed — NOT active yet. A workspace admin reviews and applies it in the browser (workspace menu → Workspace rules). Tell the user it is waiting there."
 	if replaced != "" {
 		note = "Proposed, replacing the previous pending proposal — NOT active yet. A workspace admin reviews and applies it in the browser (workspace menu → Workspace rules). Tell the user it is waiting there."
