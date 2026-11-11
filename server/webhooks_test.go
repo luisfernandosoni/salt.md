@@ -586,6 +586,119 @@ func TestCreateRowsFiresOneRowEventPerRow(t *testing.T) {
 	}
 }
 
+// --- A row being built is not a row that changed ----------------------------
+//
+// create_rows and create_page write a row's properties in the same call that
+// inserts the page. Every one of those writes used to report row.updated, so a
+// receiver got "updated" for a row it had never been told about: replaying
+// created-then-updated in the wrong order leaves a mirror that either misses
+// the row or holds a half-built copy of it. The row is announced once, at the
+// end, when it is complete.
+
+func TestCreateRowsWithPropertiesFiresOnlyRowCreated(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "createrows-quiet@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "row.created,row.updated", "s")
+
+	if _, err := callTool(t, s, u, "create_rows",
+		`{"page_id":"`+coll+`","rows":[{"title":"A","properties":{"status":"open"}}]}`); err != nil {
+		t.Fatalf("create_rows: %v", err)
+	}
+	p := sink.payload(t, sink.next(t, 3*time.Second))
+	if p["event"] != "row.created" {
+		t.Fatalf("the event is %v, want row.created — properties written while the row is built are not an update", p["event"])
+	}
+	if p["collectionId"] != coll {
+		t.Errorf("collectionId is %v, want %s", p["collectionId"], coll)
+	}
+	if !sink.silent(500 * time.Millisecond) {
+		t.Fatal("create_rows delivered a second event for a row it was still building — a receiver has to reconcile an update for a row it never saw created")
+	}
+
+	// Suppressing the event must not suppress the write it used to announce.
+	var props string
+	if err := s.db.QueryRow(`SELECT props FROM pages WHERE parent_id = ? AND title = 'A'`, coll).Scan(&props); err != nil {
+		t.Fatalf("row props: %v", err)
+	}
+	if !strings.Contains(props, "open") {
+		t.Errorf("row props are %s — the row was announced created without its properties", props)
+	}
+}
+
+// The same rule on the single-row path: metadata and properties passed to
+// create_page belong to the creation, not to a separate change.
+func TestCreatePageWithTagsAndPropertiesFiresOnlyRowCreated(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "createpage-quiet@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "row.created,row.updated", "s")
+
+	if _, err := callTool(t, s, u, "create_page",
+		`{"title":"From the agent","parent_id":"`+coll+`","tags":["one"],"properties":{"status":"open"}}`); err != nil {
+		t.Fatalf("create_page: %v", err)
+	}
+	p := sink.payload(t, sink.next(t, 3*time.Second))
+	if p["event"] != "row.created" {
+		t.Fatalf("the event is %v, want row.created — tags and properties passed to create_page are part of the creation", p["event"])
+	}
+	if !sink.silent(500 * time.Millisecond) {
+		t.Fatal("create_page with tags + properties delivered a row.updated before row.created")
+	}
+
+	var tags, props string
+	if err := s.db.QueryRow(`SELECT tags, props FROM pages WHERE title = 'From the agent'`).Scan(&tags, &props); err != nil {
+		t.Fatalf("created row: %v", err)
+	}
+	if !strings.Contains(tags, "one") || !strings.Contains(props, "open") {
+		t.Errorf("created row has tags %s and props %s — the quiet path dropped them", tags, props)
+	}
+}
+
+// One call, one event. update_page can move a page into a database and rename
+// it in the same breath; the move and the rename each used to report
+// row.updated, so a receiver got two messages for one change and no way to
+// tell them apart.
+func TestUpdatePageMoveAndRenameFiresOneRowUpdated(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "updatepage-one@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	page := s.makePage(t, ws, uid, "", "Loose", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "row.updated", "s")
+
+	if _, err := callTool(t, s, u, "update_page",
+		`{"page_id":"`+page+`","parent_id":"`+coll+`","title":"Renamed"}`); err != nil {
+		t.Fatalf("update_page: %v", err)
+	}
+	p := sink.payload(t, sink.next(t, 3*time.Second))
+	if p["event"] != "row.updated" {
+		t.Errorf("event is %v, want row.updated", p["event"])
+	}
+	if p["collectionId"] != coll {
+		t.Errorf("collectionId is %v, want %s", p["collectionId"], coll)
+	}
+	if !sink.silent(500 * time.Millisecond) {
+		t.Fatal("update_page with parent_id + title fired more than one row.updated — a move and a rename in one call are one change")
+	}
+
+	var parent, title string
+	if err := s.db.QueryRow(`SELECT COALESCE(parent_id, ''), title FROM pages WHERE id = ?`, page).Scan(&parent, &title); err != nil {
+		t.Fatalf("updated page: %v", err)
+	}
+	if parent != coll || title != "Renamed" {
+		t.Errorf("page is under %q with title %q — the coalescing dropped a half of the call", parent, title)
+	}
+}
+
 // The UI, the catalogue and the map must name the same six events. The dialog
 // is only a view of webhookEvents, and a worker can add one without the other.
 func TestWebhookEventCatalogueMatchesTheDialog(t *testing.T) {

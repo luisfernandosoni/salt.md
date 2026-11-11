@@ -969,10 +969,11 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 			}
 			// Cover, description and tags in the same call, for the same reason
 			// the properties are: a second call is one nobody makes. Routed
-			// through mcpUpdatePageMeta so the cover is validated and the tags
-			// normalised exactly as they are everywhere else.
+			// through mcpUpdatePageMetaQuiet so the cover is validated and the
+			// tags normalised exactly as they are everywhere else — and so it
+			// stays quiet: the row is announced once, as created, at the end.
 			if args.Cover != "" || args.Description != "" || args.Tags != nil {
-				if _, err := s.mcpUpdatePageMeta(id, "", "", args.Cover, args.Description, "", args.Tags); err != nil {
+				if _, err := s.mcpUpdatePageMetaQuiet(id, "", "", args.Cover, args.Description, "", args.Tags); err != nil {
 					return "", fmt.Errorf("page created (%s) but its metadata failed: %w", id, err)
 				}
 			}
@@ -997,6 +998,12 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 			// their own. Order matters: move first, so a failed move does not leave
 			// a half-renamed page behind.
 			done := []string{}
+			// One call, one event. A row moved into a database AND renamed by the
+			// same call used to report row.updated twice — once from the move and
+			// once from the metadata — so a receiver had to reconcile two messages
+			// that described one change. The sub-steps stay quiet and the call
+			// reports once, at the end, when everything succeeded.
+			rowTouched := false
 			// args.ParentID != nil covers "" too — that is a move to the top level,
 			// and it has to be distinguishable from not asking for a move at all.
 			if args.ParentID != nil || args.WorkspaceID != "" {
@@ -1005,6 +1012,9 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 					return "", err
 				}
 				done = append(done, msg)
+				// A workspace move is not a re-parenting inside a database; only
+				// parent_id can make a page a row of a collection it was not in.
+				rowTouched = rowTouched || args.ParentID != nil
 			}
 			if args.Favorite != nil {
 				msg, err := s.mcpSetFavorite(userID, args.PageID, *args.Favorite)
@@ -1016,15 +1026,19 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 			hasMeta := args.Title != "" || args.Icon != "" || args.Cover != "" ||
 				args.Description != "" || args.Visibility != "" || args.Tags != nil
 			if hasMeta {
-				msg, err := s.mcpUpdatePageMeta(args.PageID, args.Title, args.Icon, args.Cover,
+				msg, err := s.mcpUpdatePageMetaQuiet(args.PageID, args.Title, args.Icon, args.Cover,
 					args.Description, args.Visibility, args.Tags)
 				if err != nil {
 					return "", err
 				}
 				done = append(done, msg)
+				rowTouched = true
 			}
 			if len(done) == 0 {
 				return "", fmt.Errorf("nothing to update: pass at least one of title, icon, cover, description, visibility, tags, parent_id, workspace_id or favorite")
+			}
+			if rowTouched {
+				s.fireRowWebhook("row.updated", args.PageID, nil)
 			}
 			return strings.Join(done, " "), nil
 		case "delete_comment":

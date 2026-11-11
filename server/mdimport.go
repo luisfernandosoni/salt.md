@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -335,9 +336,24 @@ func mdToBlocksJSON(md string) (string, error) {
 // saw: the page is read inside the same transaction that writes it, and a
 // mismatch refuses before anything moves — no content, no doc_gen, no Yjs
 // reset, and no revision (the snapshot happens after the commit).
+//
+// A trashed page is not a page to write into: both the read and the write name
+// `trashed_at IS NULL`, so an append to a page somebody threw away answers
+// "not found" like replace and prepend do, instead of writing into the trash.
 func (s *Server) appendMarkdownToPage(pageID, md string, ifMatchDocGen *int64) error {
 	blocks := mdToBlocks(md)
 	if len(blocks) == 0 {
+		// Nothing to append, but the call is still a claim about the page: that
+		// it exists, that it is not in the trash, and (with the guard) that the
+		// caller wrote against the body that is there now. Answering nil without
+		// looking told an agent with a stale generation that its write had landed.
+		var gen int64
+		if err := s.db.QueryRow(`SELECT doc_gen FROM pages WHERE id = ? AND trashed_at IS NULL`, pageID).Scan(&gen); err != nil {
+			return fmt.Errorf("page %q not found", pageID)
+		}
+		if ifMatchDocGen != nil && gen != *ifMatchDocGen {
+			return docGenConflict(pageID, gen, *ifMatchDocGen)
+		}
 		return nil // nothing to append; don't disturb open editors
 	}
 	tx, err := s.db.Begin()
@@ -348,8 +364,8 @@ func (s *Server) appendMarkdownToPage(pageID, md string, ifMatchDocGen *int64) e
 
 	var content string
 	var gen int64
-	if err := tx.QueryRow(`SELECT content, doc_gen FROM pages WHERE id = ?`, pageID).Scan(&content, &gen); err != nil {
-		return err
+	if err := tx.QueryRow(`SELECT content, doc_gen FROM pages WHERE id = ? AND trashed_at IS NULL`, pageID).Scan(&content, &gen); err != nil {
+		return fmt.Errorf("page %q not found", pageID)
 	}
 	if ifMatchDocGen != nil && gen != *ifMatchDocGen {
 		return docGenConflict(pageID, gen, *ifMatchDocGen)
@@ -369,7 +385,7 @@ func (s *Server) appendMarkdownToPage(pageID, md string, ifMatchDocGen *int64) e
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE pages SET content = ?, updated_at = ?, `+bumpDocGen+` WHERE id = ? AND doc_gen = ?`, string(merged), now(), pageID, gen); err != nil {
+	if _, err := tx.Exec(`UPDATE pages SET content = ?, updated_at = ?, `+bumpDocGen+` WHERE id = ? AND trashed_at IS NULL AND doc_gen = ?`, string(merged), now(), pageID, gen); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
