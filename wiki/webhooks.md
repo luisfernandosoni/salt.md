@@ -103,17 +103,24 @@ the coverage is not complete. This is what fires today:
 | A page created by an agent with `create_page` | `page.created`, plus `row.created` when the parent is a database |
 | Rows added by an agent with `create_rows` | `page.created` and `row.created`, one pair per row |
 | Editing a page's text in the editor | `page.updated` |
-| Renaming, changing icon, cover, description, tags, visibility or properties | `page.updated`, plus `row.updated` for a row |
+| Renaming a page, or changing its icon, cover, description, tags, visibility or properties, from the browser or over the REST API | `page.updated`, plus `row.updated` for a row |
 | Changing a row's properties in the browser | `page.updated` and `row.updated`, with `changedProperties` |
-| An agent changing a row's properties with `set_properties` or `batch_set_properties` | `page.updated` and `row.updated`, with `changedProperties` |
-| An agent renaming a row with `update_page` | `row.updated` |
-| Moving a page under a different parent | `page.updated`, plus `row.updated` for a row |
+| An agent changing a row's properties with `set_properties` — one row, or several through the updates list of the same tool | `row.updated`, with `changedProperties`; no `page.updated` |
+| An agent renaming a row with `update_page` | `row.updated`, once per call even when the same call also moves it |
+| Moving a page under a different parent from the browser | `page.updated`, plus `row.updated` for a row |
 | Dragging a page up or down in the sidebar (a position is a detail like any other) | `page.updated` |
 | Marking a page as a template, or removing that flag | `page.updated` |
 | An agent replacing a body with `write_content` in mode `replace` | `page.updated` |
 | Moving a page to the trash | `page.trashed`, one per page in the subtree, plus `row.deleted` for every row in it |
 | Deleting a page for good from the trash | `page.trashed`, one per page in the subtree, plus `row.deleted` for every row in it |
 | An agent moving a page to the trash with `set_trashed` | `page.trashed`, one per page in the subtree, plus `row.deleted` for every row in it |
+
+A row is announced once, when it is finished. Properties and tags passed to
+`create_rows` or `create_page` are written while the row is being built, and
+they do not produce a `row.updated` before the `row.created` that carries the
+completed row. One call that changes a row reports one `row.updated`, however
+many of its details the call touched: a `update_page` that moves a page into a
+database and renames it in the same breath is one message, not two.
 
 And this is what produces **no** message at all, which is the part worth knowing
 before you build on it:
