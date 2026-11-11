@@ -128,6 +128,10 @@ func (s *Server) mcpSetProperties(pageID string, properties json.RawMessage, act
 	// An open board must show the move without a reload — that is the whole
 	// point of an agent working while somebody watches.
 	s.rowChanged(pageID)
+	// And a receiver watching this database hears which properties moved. Batch
+	// updates go through here too (mcpBatchSetProperties), so they fire once per
+	// row without a second call site.
+	s.fireRowWebhook("row.updated", pageID, changed)
 
 	// Its own audit entry, carrying the diff — the generic one in the MCP
 	// dispatch has no way to know what changed. set_properties is excluded
@@ -311,6 +315,8 @@ func (s *Server) mcpMovePage(userID, pageID, parentID string) (string, error) {
 			return "", err
 		}
 		s.pagesChanged()
+		s.rowChanged(pageID)
+		s.fireRowWebhook("row.updated", pageID, nil)
 		return fmt.Sprintf("Moved page %s to the top level", pageID), nil
 	}
 	within, err := isWithinSubtree(tx, pageID, parentID)
@@ -331,6 +337,8 @@ func (s *Server) mcpMovePage(userID, pageID, parentID string) (string, error) {
 		return "", err
 	}
 	s.pagesChanged()
+	s.rowChanged(pageID)
+	s.fireRowWebhook("row.updated", pageID, nil)
 	return fmt.Sprintf("Moved page %s under %s", pageID, parentID), nil
 }
 

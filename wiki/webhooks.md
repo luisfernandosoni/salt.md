@@ -1,10 +1,11 @@
 # Webhooks
 
 A webhook is a standing instruction to call an address of your choosing when a
-page is created, changed or thrown away. Instead of another program asking Salt
-over and over whether anything is new, Salt calls it. That is what Zapier, Make
-and n8n need to start a scenario, and it is what a script on your own server
-needs to react to a page without polling.
+page is created, changed or thrown away — or when a row of a database is added,
+changed or removed. Instead of another program asking Salt over and over whether
+anything is new, Salt calls it. That is what Zapier, Make and n8n need to start
+a scenario, and it is what a script on your own server needs to react to a page
+without polling.
 
 Webhooks are instance configuration, not content. Only an instance admin can add
 or remove one, and only from a signed-in browser: an [API token](api.md) cannot
@@ -19,7 +20,7 @@ workspace and it fires for pages in every workspace on the instance.
 3. Under **Address to call**, paste the URL your receiver listens on. It has to
    start with `https://` or `http://`, name a host, and be at most 500
    characters.
-4. Under **When should we call?**, tick at least one of the three events. Each
+4. Under **When should we call?**, tick at least one of the six events. Each
    line shows the plain wording and the event name that will appear in the
    message.
 5. Press **Add**. The button reads *Saving…* while the request is in flight.
@@ -41,8 +42,9 @@ If you are creating hooks over the API rather than in the dialog, one thing is
 worth knowing: an event name the server does not recognise is dropped without a
 word. Sending `["page.created", "page.deleted"]` succeeds and leaves a hook
 subscribed to `page.created` alone. Only when nothing survives that filter does
-the server answer *Pick at least one event: page.created, page.updated or
-page.trashed.* Compare the `events` field of the answer against what you sent.
+the server answer *Pick at least one event: page.created, page.updated,
+page.trashed, row.created, row.updated or row.deleted.* Compare the `events`
+field of the answer against what you sent.
 
 ## The secret, shown once
 
@@ -69,33 +71,49 @@ the database as it is. An instance backup (the owner's **Download backup
 therefore contains every webhook secret on the instance. Keep the archive as
 carefully as you would keep the secret.
 
-## The three events
+## The six events
+
+Two families, three events each. The `page.*` events name a page; the `row.*`
+events name a row of a database, which is a page too, and carry the database it
+belongs to.
 
 | Event | The interface calls it | Fires when |
 | --- | --- | --- |
 | `page.created` | a page is created | a page is added |
 | `page.updated` | a page is changed | a page's body or its details change |
 | `page.trashed` | a page is thrown away | a page goes to the trash, or is deleted for good |
+| `row.created` | a row is added | a row is added to a database |
+| `row.updated` | a row is changed | a row's title, icon, cover or properties change |
+| `row.deleted` | a row is removed | a row goes to the trash, or is deleted for good |
 
-There are three and no more. Each one is fired from real places in the code; an
+There are six and no more. Each one is fired from real places in the code; an
 event that is documented but never arrives is worse than one that does not
 exist, so the list stays short.
+
+A `row.*` event only ever names a page inside a database. A document, a
+collection page and anything under a document's own sub-tree never produce one,
+however they change.
 
 **Which actions actually produce a message** matters more than the names, and
 the coverage is not complete. This is what fires today:
 
 | Action | Message |
 | --- | --- |
-| New page, new collection, or a new row in a collection, from the browser | `page.created` |
-| A page created by an agent with `create_page` | `page.created` |
+| New page, new collection, or a new row in a collection, from the browser | `page.created`, plus `row.created` for the row |
+| A page created by an agent with `create_page` | `page.created`, plus `row.created` when the parent is a database |
+| Rows added by an agent with `create_rows` | `page.created` and `row.created`, one pair per row |
 | Editing a page's text in the editor | `page.updated` |
-| Renaming, changing icon, cover, description, tags, visibility or properties | `page.updated` |
-| Moving a page under a different parent | `page.updated` |
+| Renaming, changing icon, cover, description, tags, visibility or properties | `page.updated`, plus `row.updated` for a row |
+| Changing a row's properties in the browser | `page.updated` and `row.updated`, with `changedProperties` |
+| An agent changing a row's properties with `set_properties` or `batch_set_properties` | `page.updated` and `row.updated`, with `changedProperties` |
+| An agent renaming a row with `update_page` | `row.updated` |
+| Moving a page under a different parent | `page.updated`, plus `row.updated` for a row |
 | Dragging a page up or down in the sidebar (a position is a detail like any other) | `page.updated` |
 | Marking a page as a template, or removing that flag | `page.updated` |
 | An agent replacing a body with `write_content` in mode `replace` | `page.updated` |
-| Moving a page to the trash | `page.trashed`, one per page in the subtree |
-| Deleting a page for good from the trash | `page.trashed`, one per page in the subtree |
+| Moving a page to the trash | `page.trashed`, one per page in the subtree, plus `row.deleted` for every row in it |
+| Deleting a page for good from the trash | `page.trashed`, one per page in the subtree, plus `row.deleted` for every row in it |
+| An agent moving a page to the trash with `set_trashed` | `page.trashed`, one per page in the subtree, plus `row.deleted` for every row in it |
 
 And this is what produces **no** message at all, which is the part worth knowing
 before you build on it:
@@ -108,7 +126,6 @@ before you build on it:
   created in the browser does fire `page.created`; the two paths differ.
 - A database placed into a document with `embed_database`. That changes the
   document's body, and no `page.updated` follows it.
-- Rows added with `create_rows`.
 - Pages created by a [form](forms.md) submission from outside.
 - Anything created by an [import](import-export.md): Markdown, a ZIP archive,
   a CSV, or `import_url`. A new workspace made from the
@@ -117,9 +134,9 @@ before you build on it:
   thousand outbound calls.
 - An agent appending or prepending text: `write_content` in its default mode
   (`append`) and in mode `prepend` are silent. Only `replace` reports.
-- An agent changing details with `update_page`, `set_properties`,
-  `update_schema` or `set_view`.
-- An agent trashing or restoring a page with `set_trashed`.
+- An agent changing details with `update_page`, `update_schema` or `set_view`. A
+  row renamed with `update_page` does report `row.updated`, but no
+  `page.updated` accompanies it.
 - Restoring a page from the [trash](trash-and-recovery.md), and restoring an
   older version with `revisions`.
 - Turning a page's public share link on or off. A `visibility` change fires
@@ -193,6 +210,42 @@ One case where the body is thinner than the example: when a page is deleted **fo
 good**, the row is gone by the time the message is built, so `title` and
 `workspaceId` arrive empty and only the id identifies it. A page moved to the
 trash normally still has both.
+
+## What a row event arrives with
+
+A `row.*` message uses the same envelope and names the row instead of the page,
+plus the database it belongs to:
+
+```json
+{
+  "event": "row.updated",
+  "at": "2026-08-07T09:20:11.002314Z",
+  "collectionId": "5c1d8e0a7b3f42e6a9d0c1b2e3f4a5b6",
+  "row": {
+    "id": "9f2c4ab1d0e34f7a8b5c6d7e8f901234",
+    "title": "Ship the release notes",
+    "workspaceId": "1a4b7c9e2f5d8a3b6c0e4f7a1b2c3d4e",
+    "path": "/p/9f2c4ab1d0e34f7a8b5c6d7e8f901234"
+  },
+  "changedProperties": ["status"]
+}
+```
+
+- `collectionId` is the database the row sits in. It is the `page_id` that
+  `get_collection` and `query_rows` take, so a receiver can read the schema
+  before it acts on a value.
+- `changedProperties` lists the property **ids** this message is about, sorted.
+  It is `[]` when the change was not a property write: a rename, an icon, a
+  move, a deletion. It never carries the values — read the row for those.
+- `row.deleted` is built from state captured **before** the delete, so unlike
+  `page.trashed` it still carries the title and the `collectionId` even when the
+  row was deleted for good. That is the only reason the collection is knowable
+  at all: after the statement, the row is not there to ask.
+- A row that goes to the trash reports `row.deleted` too. The trash hides the
+  row from its board, so for a receiver the row is gone from the database until
+  it is restored.
+- The body still never carries the row's content, and it carries no permission
+  check: the title and workspace id go out for every row the event applies to.
 
 ## Verifying the signature
 

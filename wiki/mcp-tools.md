@@ -394,8 +394,11 @@ typo.
 | `page_id` | string | yes |
 
 Returns `page_id`, `workspace_id`, `my_role`, `can_read`, `can_write`,
-`can_delete`, `in_trash` and `read_only_reason`, the last being
+`can_delete`, `in_trash`, `doc_gen` and `read_only_reason`, the last being
 `this API token is read-only`, `you are a viewer in this workspace`, or empty.
+
+`doc_gen` is the page's current document generation — the number `write_content`
+takes as `if_match_docgen` when you want to write against exactly this state.
 
 Cheaper than attempting a write and failing. Errors: `page "…" not found`,
 which is also what you get for a page you may not read.
@@ -496,9 +499,33 @@ Write Markdown into a page's body.
 | `page_id` | string | yes |
 | `markdown` | string | yes |
 | `mode` | string | no: `append` (default), `prepend`, `replace` |
+| `if_match_docgen` | integer | no |
 
 `append` is the default because it is the only one of the three that cannot
 destroy anything.
+
+### Writing against a state you have seen
+
+`if_match_docgen` is an optimistic concurrency guard. Pass the `doc_gen` you read
+from `get_permissions` (or from `GET /api/pages/{id}`) and the write only lands
+while the page is still at that generation:
+
+```
+write_content(page_id: "…", markdown: "## Update", if_match_docgen: 3)
+```
+
+If something else — an editor, another agent — has replaced the body in the
+meantime, the call is refused with `409 Conflict: page "…" doc_gen is 4
+(expected 3) — fetch latest page state before writing`. A refused write changes
+nothing: the content, the generation, the live editor document and the version
+history are all left as they were. Fetch the page again, decide against the new
+state, and retry with the new number.
+
+Leaving `if_match_docgen` out keeps the old unguarded behaviour. `0` is a real
+generation (a page whose body has never been replaced from outside), so it is
+not the same as leaving the field out — which is why the server treats it as a
+number, not as "nothing". Negative values are refused with `if_match_docgen must
+be >= 0`.
 
 All three leave a revision behind, but not the same one, and the difference is
 the whole point of the history:
@@ -522,7 +549,9 @@ Returns `Appended content to page <id>`, `Prepended N block(s) to page <id>` or
 `Replaced content of page <id>`.
 
 Errors: `unknown mode "x" — use append (the default), prepend or replace`;
-`markdown is empty` (prepend); `page "…" not found`.
+`markdown is empty` (prepend); `page "…" not found`;
+`if_match_docgen must be >= 0`; and the `409 Conflict` refusal above, which
+leaves the page untouched.
 
 ### duplicate_page
 

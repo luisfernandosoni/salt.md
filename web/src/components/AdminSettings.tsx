@@ -18,6 +18,35 @@ const fmtUptime = (sec: number) => {
   return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
 };
 
+// The events a hook can subscribe to, in the order the dialog lists them. The
+// plain wording is the translation key (see i18n.ts), and the code beside each
+// box is what actually arrives in the message.
+const HOOK_EVENT_IDS = [
+  'page.created',
+  'page.updated',
+  'page.trashed',
+  'row.created',
+  'row.updated',
+  'row.deleted',
+] as const;
+
+function hookEventLabel(ev: (typeof HOOK_EVENT_IDS)[number]): string {
+  switch (ev) {
+    case 'page.created':
+      return t('a page is created');
+    case 'page.updated':
+      return t('a page is changed');
+    case 'page.trashed':
+      return t('a page is thrown away');
+    case 'row.created':
+      return t('a row is added');
+    case 'row.updated':
+      return t('a row is changed');
+    case 'row.deleted':
+      return t('a row is removed');
+  }
+}
+
 // A read-only config snippet with a copy button.
 function ConfBlock({ title, text }: { title: string; text: string }) {
   return (
@@ -784,7 +813,7 @@ ingress:
                     />
                     <label>{t('When should we call?')}</label>
                     <div className="hook-events">
-                      {(['page.created', 'page.updated', 'page.trashed'] as const).map((ev) => (
+                      {HOOK_EVENT_IDS.map((ev) => (
                         <label key={ev} className="hook-event">
                           <input
                             type="checkbox"
@@ -795,13 +824,7 @@ ingress:
                               )
                             }
                           />
-                          <span>
-                            {ev === 'page.created'
-                              ? t('a page is created')
-                              : ev === 'page.updated'
-                                ? t('a page is changed')
-                                : t('a page is thrown away')}
-                          </span>
+                          <span>{hookEventLabel(ev)}</span>
                           <code>{ev}</code>
                         </label>
                       ))}
