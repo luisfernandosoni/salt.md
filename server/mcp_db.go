@@ -131,7 +131,16 @@ func (s *Server) mcpSetProperties(pageID string, properties json.RawMessage, act
 	// And a receiver watching this database hears which properties moved. Batch
 	// updates go through here too (mcpBatchSetProperties), so they fire once per
 	// row without a second call site.
-	s.fireRowWebhook("row.updated", pageID, changed)
+	//
+	// actor is what tells a change apart from a construction. create_rows and
+	// create_page pass nil while they write the properties of a row they have
+	// not announced yet, and row.updated for a row nobody has heard of is a
+	// message a receiver cannot place: replaying it before row.created leaves a
+	// mirror holding a half-built row. Those calls announce the finished row
+	// once, as row.created, at the end.
+	if actor != nil {
+		s.fireRowWebhook("row.updated", pageID, changed)
+	}
 
 	// Its own audit entry, carrying the diff — the generic one in the MCP
 	// dispatch has no way to know what changed. set_properties is excluded
@@ -280,6 +289,12 @@ func (s *Server) mcpMovePageOrWorkspace(u *user, pageID, parentID, wsID string) 
 }
 
 // mcpMovePage reparents a page (empty parentID = top level) with a cycle guard.
+//
+// It reports no row.updated of its own: its only caller is update_page, which
+// may also rename the page in the same call and fires ONE event for the call.
+// Two fires here (move + rename) told a receiver two different things had
+// happened when one had.
+//
 // IMPORTANT: with SetMaxOpenConns(1) an open tx holds the only connection, so
 // all access checks that query via s.db MUST happen BEFORE tx.Begin — calling
 // s.canWrite inside the tx would deadlock the whole server.
@@ -316,7 +331,6 @@ func (s *Server) mcpMovePage(userID, pageID, parentID string) (string, error) {
 		}
 		s.pagesChanged()
 		s.rowChanged(pageID)
-		s.fireRowWebhook("row.updated", pageID, nil)
 		return fmt.Sprintf("Moved page %s to the top level", pageID), nil
 	}
 	within, err := isWithinSubtree(tx, pageID, parentID)
@@ -338,7 +352,6 @@ func (s *Server) mcpMovePage(userID, pageID, parentID string) (string, error) {
 	}
 	s.pagesChanged()
 	s.rowChanged(pageID)
-	s.fireRowWebhook("row.updated", pageID, nil)
 	return fmt.Sprintf("Moved page %s under %s", pageID, parentID), nil
 }
 

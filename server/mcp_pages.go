@@ -21,6 +21,19 @@ import (
 // change title and icon, and was shut out of tags, cover and visibility even
 // though the interface offers them.
 func (s *Server) mcpUpdatePageMeta(pageID, title, icon, cover, description, visibility string, tags *[]string) (string, error) {
+	return s.mcpUpdatePageMetaWith(pageID, title, icon, cover, description, visibility, tags, true)
+}
+
+// mcpUpdatePageMetaQuiet applies the same changes and reports nothing, for the
+// two callers that own the events of a whole call: create_page, which announces
+// the row once as created after all of it succeeded, and update_page, which
+// coalesces a move and a rename into a single row.updated. Without it, a page
+// created with tags and properties delivered row.updated before row.created.
+func (s *Server) mcpUpdatePageMetaQuiet(pageID, title, icon, cover, description, visibility string, tags *[]string) (string, error) {
+	return s.mcpUpdatePageMetaWith(pageID, title, icon, cover, description, visibility, tags, false)
+}
+
+func (s *Server) mcpUpdatePageMetaWith(pageID, title, icon, cover, description, visibility string, tags *[]string, fireWebhook bool) (string, error) {
 	sets := []string{"updated_at = ?"}
 	sqlArgs := []any{now()}
 	changed := []string{}
@@ -81,9 +94,12 @@ func (s *Server) mcpUpdatePageMeta(pageID, title, icon, cover, description, visi
 	s.reindexPage(pageID)
 	s.pagesChanged()
 	// A row whose title/icon/cover changed is still a row: the board showing it
-	// has to redraw the card, and a receiver watching the database hears it.
+	// has to redraw the card, and a receiver watching the database hears it —
+	// unless the caller is emitting its own single event for the whole call.
 	s.rowChanged(pageID)
-	s.fireRowWebhook("row.updated", pageID, nil)
+	if fireWebhook {
+		s.fireRowWebhook("row.updated", pageID, nil)
+	}
 	return fmt.Sprintf("Updated %s on page %s", strings.Join(changed, ", "), pageID), nil
 }
 
