@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -48,10 +49,17 @@ const webhookTimeout = 10 * time.Second
 // webhookEvents are the events a hook can subscribe to. Deliberately few: each
 // one has to be fired from real call sites, and an event that is documented but
 // never arrives is worse than one that does not exist.
+//
+// The three page.* events name a page; the three row.* events name a row of a
+// database (which is a page too) and carry its collection, so a receiver can
+// act on "a card moved to Done" without diffing a whole board.
 var webhookEvents = map[string]bool{
 	"page.created": true,
 	"page.updated": true,
 	"page.trashed": true,
+	"row.created":  true,
+	"row.updated":  true,
+	"row.deleted":  true,
 }
 
 type webhook struct {
@@ -130,7 +138,7 @@ func (s *Server) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(events) == 0 {
 		httpErrorCode(w, 400, "webhook_no_events",
-			"Pick at least one event: page.created, page.updated or page.trashed.")
+			"Pick at least one event: page.created, page.updated, page.trashed, row.created, row.updated or row.deleted.")
 		return
 	}
 	secret := newID() + newID()
@@ -166,27 +174,7 @@ func (s *Server) fireWebhook(event, pageID string) {
 	if !webhookEvents[event] {
 		return
 	}
-	rows, err := s.db.Query(`SELECT id, url, secret, events FROM webhooks WHERE active = 1`)
-	if err != nil {
-		return
-	}
-	type target struct{ id, url, secret string }
-	var targets []target
-	for rows.Next() {
-		var t target
-		var events string
-		if rows.Scan(&t.id, &t.url, &t.secret, &events) != nil {
-			continue
-		}
-		for _, e := range strings.Split(events, ",") {
-			if strings.TrimSpace(e) == event {
-				targets = append(targets, t)
-				break
-			}
-		}
-	}
-	// Drain before the next query — one DB connection (see CLAUDE.md).
-	rows.Close()
+	targets := s.webhookTargets(event)
 	if len(targets) == 0 {
 		return
 	}
@@ -211,6 +199,116 @@ func (s *Server) fireWebhook(event, pageID string) {
 	for _, t := range targets {
 		go s.deliverWebhook(t.id, t.url, t.secret, payload)
 	}
+}
+
+// webhookTarget is one active hook that asked for a given event.
+type webhookTarget struct{ id, url, secret string }
+
+// webhookTargets reads the active hooks subscribed to an event. The rows are
+// drained before returning — there is one database connection, so a caller
+// that queried again with a cursor still open would wait forever.
+func (s *Server) webhookTargets(event string) []webhookTarget {
+	rows, err := s.db.Query(`SELECT id, url, secret, events FROM webhooks WHERE active = 1`)
+	if err != nil {
+		return nil
+	}
+	var targets []webhookTarget
+	for rows.Next() {
+		var t webhookTarget
+		var events string
+		if rows.Scan(&t.id, &t.url, &t.secret, &events) != nil {
+			continue
+		}
+		for _, e := range strings.Split(events, ",") {
+			if strings.TrimSpace(e) == event {
+				targets = append(targets, t)
+				break
+			}
+		}
+	}
+	rows.Close()
+	return targets
+}
+
+// rowWebhookMeta is what a row.* event has to know about a row, captured while
+// the row still exists. A hard delete removes the pages row, so anything read
+// after the commit would come back empty — and the collection id would be lost
+// with it.
+type rowWebhookMeta struct {
+	RowID        string
+	CollectionID string
+	Title        string
+	WorkspaceID  string
+	Changed      []string
+}
+
+// lookupCollectionRow reports whether rowID is a row of a database, and if so
+// what the event needs to name it. A page that is not a row (a document, a
+// collection itself) is not a row event, whatever else happens to it.
+//
+// Both queries run outside any transaction, and the cursor of the first is
+// closed by QueryRow before the second — one connection.
+func (s *Server) lookupCollectionRow(rowID string) (rowWebhookMeta, bool) {
+	var parentID, title, wsID string
+	if s.db.QueryRow(`SELECT COALESCE(parent_id, ''), title, workspace_id FROM pages WHERE id = ?`, rowID).
+		Scan(&parentID, &title, &wsID) != nil {
+		return rowWebhookMeta{}, false
+	}
+	if parentID == "" {
+		return rowWebhookMeta{}, false
+	}
+	var isCollection int
+	if s.db.QueryRow(`SELECT COUNT(*) FROM collections WHERE page_id = ?`, parentID).Scan(&isCollection) != nil || isCollection == 0 {
+		return rowWebhookMeta{}, false
+	}
+	return rowWebhookMeta{RowID: rowID, CollectionID: parentID, Title: title, WorkspaceID: wsID}, true
+}
+
+// fireRowWebhookMeta emits a row.* event for metadata that was captured
+// earlier. The payload never carries the row's body, the same rule the page
+// events follow: a webhook names an object, it does not export it.
+func (s *Server) fireRowWebhookMeta(event string, meta rowWebhookMeta) {
+	if !webhookEvents[event] || meta.RowID == "" {
+		return
+	}
+	targets := s.webhookTargets(event)
+	if len(targets) == 0 {
+		return
+	}
+	changed := append([]string{}, meta.Changed...)
+	// Sorted: the caller collects keys from a Go map, and a payload whose field
+	// order changes between two identical events is a receiver's problem for
+	// free.
+	sort.Strings(changed)
+	payload, err := json.Marshal(map[string]any{
+		"event":        event,
+		"at":           now(),
+		"collectionId": meta.CollectionID,
+		"row": map[string]any{
+			"id":          meta.RowID,
+			"title":       meta.Title,
+			"workspaceId": meta.WorkspaceID,
+			"path":        "/p/" + meta.RowID,
+		},
+		"changedProperties": changed,
+	})
+	if err != nil {
+		return
+	}
+	for _, t := range targets {
+		go s.deliverWebhook(t.id, t.url, t.secret, payload)
+	}
+}
+
+// fireRowWebhook is the convenience form for call sites that still have the
+// row: it looks the collection up and stays silent for a page that is not one.
+func (s *Server) fireRowWebhook(event, rowID string, changed []string) {
+	meta, ok := s.lookupCollectionRow(rowID)
+	if !ok {
+		return
+	}
+	meta.Changed = changed
+	s.fireRowWebhookMeta(event, meta)
 }
 
 func (s *Server) deliverWebhook(id, target, secret string, payload []byte) {

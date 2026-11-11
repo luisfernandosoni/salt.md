@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -244,5 +245,356 @@ func TestWebhookGuardIsInTheDeliveryPath(t *testing.T) {
 	s.db.QueryRow(`SELECT COALESCE(last_status,'') FROM webhooks WHERE id = ?`, hookID).Scan(&status)
 	if !strings.Contains(status, "failed") {
 		t.Errorf("last_status is %q — a refused delivery has to be visible to an admin", status)
+	}
+}
+
+// --- row.* events -----------------------------------------------------------
+//
+// A board is where the work happens, and it used to be the one thing an
+// integration could not hear: `row.created`, `row.updated` and `row.deleted`
+// exist so a receiver can react to a card moving without polling the whole
+// database. These drive the real call sites — REST and MCP — because an event
+// that is only fired from a test proves nothing about the paths people use.
+
+// hookSink is a receiver that keeps every delivery and hands them out over a
+// channel, so a test can wait for the third one without sleeping.
+type hookSink struct {
+	mu  sync.Mutex
+	got []hookCall
+	ch  chan hookCall
+}
+
+type hookCall struct {
+	body []byte
+	sig  string
+}
+
+func newHookSink() *hookSink {
+	return &hookSink{ch: make(chan hookCall, 64)}
+}
+
+func (h *hookSink) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	c := hookCall{body: body, sig: r.Header.Get("X-Salt-Signature")}
+	h.mu.Lock()
+	h.got = append(h.got, c)
+	h.mu.Unlock()
+	select {
+	case h.ch <- c:
+	default:
+	}
+	w.WriteHeader(200)
+}
+
+func (h *hookSink) next(t *testing.T, d time.Duration) hookCall {
+	t.Helper()
+	select {
+	case c := <-h.ch:
+		return c
+	case <-time.After(d):
+		t.Fatalf("no delivery within %s", d)
+		return hookCall{}
+	}
+}
+
+// silent waits out the window and reports whether nothing arrived. It drains
+// the channel rather than counting, so a delivery a previous step already
+// consumed cannot be mistaken for a new one.
+func (h *hookSink) silent(d time.Duration) bool {
+	time.Sleep(d)
+	select {
+	case <-h.ch:
+		return false
+	default:
+		return true
+	}
+}
+
+func (h *hookSink) payload(t *testing.T, c hookCall) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(c.body, &m); err != nil {
+		t.Fatalf("payload is not JSON: %v\n%s", err, c.body)
+	}
+	return m
+}
+
+// hookFor subscribes a sink to exactly one event on a normal test server.
+func hookFor(t *testing.T, s *Server, sink *hookSink, events, secret string) *httptest.Server {
+	t.Helper()
+	recv := httptest.NewServer(sink)
+	t.Cleanup(recv.Close)
+	s.webhookTransport = http.DefaultTransport
+	if _, err := s.db.Exec(`INSERT INTO webhooks (id, url, secret, events, active, created_at)
+		VALUES (?, ?, ?, ?, 1, ?)`, newID(), recv.URL, secret, events, now()); err != nil {
+		t.Fatalf("insert webhook: %v", err)
+	}
+	return recv
+}
+
+func signedBody(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// A row created through REST arrives as row.created, it names its database, and
+// it is signed like every other delivery.
+func TestRowCreatedWebhookNamesItsCollection(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "rowcreated@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	sink := newHookSink()
+	const secret = "row-secret"
+	hookFor(t, s, sink, "row.created", secret)
+
+	rec := requestAs(t, s, cookie, "POST", "/api/pages", `{"parentId":"`+coll+`","title":"Ship it"}`)
+	if rec.Code != 200 {
+		t.Fatalf("create row: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	var created map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("create answer is not JSON: %v", err)
+	}
+	rowID, _ := created["id"].(string)
+
+	c := sink.next(t, 3*time.Second)
+	if got := c.sig; got != signedBody(secret, c.body) {
+		t.Errorf("signature is %q, want the HMAC of the body", got)
+	}
+	p := sink.payload(t, c)
+	if p["event"] != "row.created" {
+		t.Errorf("event is %v", p["event"])
+	}
+	if p["collectionId"] != coll {
+		t.Errorf("collectionId is %v, want %s", p["collectionId"], coll)
+	}
+	row, _ := p["row"].(map[string]any)
+	if row["id"] != rowID {
+		t.Errorf("row id is %v, want %s", row["id"], rowID)
+	}
+	if row["title"] != "Ship it" {
+		t.Errorf("row title is %v", row["title"])
+	}
+	if row["path"] != "/p/"+rowID {
+		t.Errorf("row path is %v", row["path"])
+	}
+	// The rule the page events follow applies here too: name it, don't export it.
+	if strings.Contains(string(c.body), "paragraph") {
+		t.Errorf("the payload carries the row's body:\n%s", c.body)
+	}
+}
+
+// A document is not a row. Nobody asked for row events on the page tree, and a
+// receiver filtering on a database must not be woken by an unrelated page.
+func TestRowEventsStayQuietForANormalPage(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "rowquiet@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	sink := newHookSink()
+	hookFor(t, s, sink, "row.created,row.updated,row.deleted", "s")
+
+	rec := requestAs(t, s, cookie, "POST", "/api/pages", `{"title":"Loose document","workspaceId":"`+ws+`"}`)
+	if rec.Code != 200 {
+		t.Fatalf("create page: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &created)
+	pageID, _ := created["id"].(string)
+
+	if !sink.silent(500 * time.Millisecond) {
+		t.Fatal("creating a document fired a row.* event")
+	}
+
+	// Nor does an update or a trash of that same page.
+	if rec := requestAs(t, s, cookie, "PATCH", "/api/pages/"+pageID, `{"title":"Renamed"}`); rec.Code != 200 {
+		t.Fatalf("update page: HTTP %d", rec.Code)
+	}
+	if rec := requestAs(t, s, cookie, "DELETE", "/api/pages/"+pageID, ""); rec.Code != 200 {
+		t.Fatalf("trash page: HTTP %d", rec.Code)
+	}
+	if !sink.silent(500 * time.Millisecond) {
+		t.Fatal("updating or trashing a document fired a row.* event")
+	}
+}
+
+// row.updated says which properties moved — that is the whole difference
+// between "something changed, fetch the row" and being able to act on it.
+func TestRowUpdatedWebhookNamesChangedProperties(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "rowupdated@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	row := s.makeRow(t, ws, uid, coll, "Card", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "row.updated", "s")
+
+	if _, err := callTool(t, s, u, "set_properties",
+		`{"page_id":"`+row+`","properties":{"status":"Done"}}`); err != nil {
+		t.Fatalf("set_properties: %v", err)
+	}
+	p := sink.payload(t, sink.next(t, 3*time.Second))
+	if p["event"] != "row.updated" {
+		t.Errorf("event is %v", p["event"])
+	}
+	if p["collectionId"] != coll {
+		t.Errorf("collectionId is %v, want %s", p["collectionId"], coll)
+	}
+	changed, _ := p["changedProperties"].([]any)
+	if len(changed) != 1 || changed[0] != "status" {
+		t.Errorf("changedProperties is %v, want [status]", p["changedProperties"])
+	}
+}
+
+// The browser's own path (propsPatch from a board) has to report the same way,
+// or a receiver sees agent changes and not human ones.
+func TestRowUpdatedWebhookFromTheBrowser(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "rowupdated-rest@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	row := s.makeRow(t, ws, uid, coll, "Card", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "row.updated", "s")
+
+	rec := requestAs(t, s, cookie, "PATCH", "/api/pages/"+row, `{"propsPatch":{"status":"Doing"}}`)
+	if rec.Code != 200 {
+		t.Fatalf("propsPatch: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	p := sink.payload(t, sink.next(t, 3*time.Second))
+	if p["event"] != "row.updated" {
+		t.Errorf("event is %v", p["event"])
+	}
+	changed, _ := p["changedProperties"].([]any)
+	if len(changed) != 1 || changed[0] != "status" {
+		t.Errorf("changedProperties is %v, want [status]", p["changedProperties"])
+	}
+}
+
+// The hard delete is the case that cannot be got right by reading after the
+// fact: `DELETE FROM pages` takes the row with it, so the collection id has to
+// be captured before the commit. Trashing and deleting for good both report.
+func TestRowDeletedWebhookSurvivesAHardDelete(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "rowdeleted@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	trashed := s.makeRow(t, ws, uid, coll, "Sent to trash", `{}`)
+	gone := s.makeRow(t, ws, uid, coll, "Deleted for good", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "row.deleted", "s")
+
+	if rec := requestAs(t, s, cookie, "DELETE", "/api/pages/"+trashed, ""); rec.Code != 200 {
+		t.Fatalf("trash row: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	p := sink.payload(t, sink.next(t, 3*time.Second))
+	if p["event"] != "row.deleted" {
+		t.Errorf("event is %v", p["event"])
+	}
+	if p["collectionId"] != coll {
+		t.Errorf("collectionId is %v, want %s", p["collectionId"], coll)
+	}
+	row, _ := p["row"].(map[string]any)
+	if row["id"] != trashed || row["title"] != "Sent to trash" {
+		t.Errorf("trashed row is %v", row)
+	}
+
+	if rec := requestAs(t, s, cookie, "DELETE", "/api/pages/"+gone+"?permanent=1", ""); rec.Code != 200 {
+		t.Fatalf("delete row for good: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	p = sink.payload(t, sink.next(t, 3*time.Second))
+	if p["collectionId"] != coll {
+		t.Errorf("collectionId is %v after a hard delete — the metadata was read too late", p["collectionId"])
+	}
+	row, _ = p["row"].(map[string]any)
+	if row["id"] != gone {
+		t.Errorf("row id is %v, want %s", row["id"], gone)
+	}
+	if row["title"] != "Deleted for good" {
+		t.Errorf("title is %v — a hard delete lost the row's title", row["title"])
+	}
+}
+
+// An agent trashing a page is the path that used to be silent for every
+// receiver, page events included. It reports both families now.
+func TestAgentTrashFiresPageAndRowEvents(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "agenttrash@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	row := s.makeRow(t, ws, uid, coll, "Agent trash", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "page.trashed,row.deleted", "s")
+
+	if _, err := callTool(t, s, u, "set_trashed", `{"page_id":"`+row+`","trashed":true}`); err != nil {
+		t.Fatalf("set_trashed: %v", err)
+	}
+	seen := map[string]map[string]any{}
+	for i := 0; i < 2; i++ {
+		p := sink.payload(t, sink.next(t, 3*time.Second))
+		ev, _ := p["event"].(string)
+		seen[ev] = p
+	}
+	if _, ok := seen["page.trashed"]; !ok {
+		t.Error("set_trashed fired no page.trashed")
+	}
+	m, ok := seen["row.deleted"]
+	if !ok {
+		t.Fatal("set_trashed fired no row.deleted")
+	}
+	if m["collectionId"] != coll {
+		t.Errorf("row.deleted collectionId is %v, want %s", m["collectionId"], coll)
+	}
+}
+
+// create_rows is a batch, and a receiver watching a database expects one
+// message per row, not one for the batch.
+func TestCreateRowsFiresOneRowEventPerRow(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "createrows@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	coll := s.makeCollection(t, ws, uid, "Tasks", `[{"id":"status","name":"Status","type":"text"}]`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "row.created", "s")
+
+	if _, err := callTool(t, s, u, "create_rows",
+		`{"page_id":"`+coll+`","rows":[{"title":"A"},{"title":"B"}]}`); err != nil {
+		t.Fatalf("create_rows: %v", err)
+	}
+	ids := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		p := sink.payload(t, sink.next(t, 3*time.Second))
+		if p["event"] != "row.created" {
+			t.Errorf("event is %v", p["event"])
+		}
+		if p["collectionId"] != coll {
+			t.Errorf("collectionId is %v, want %s", p["collectionId"], coll)
+		}
+		row, _ := p["row"].(map[string]any)
+		id, _ := row["id"].(string)
+		ids[id] = true
+	}
+	if len(ids) != 2 {
+		t.Errorf("two rows produced %d distinct row ids", len(ids))
+	}
+	if !sink.silent(300 * time.Millisecond) {
+		t.Error("create_rows of two rows delivered more than two row.created events")
+	}
+}
+
+// The UI, the catalogue and the map must name the same six events. The dialog
+// is only a view of webhookEvents, and a worker can add one without the other.
+func TestWebhookEventCatalogueMatchesTheDialog(t *testing.T) {
+	for _, ev := range []string{"page.created", "page.updated", "page.trashed", "row.created", "row.updated", "row.deleted"} {
+		if !webhookEvents[ev] {
+			t.Errorf("%s is not an accepted webhook event", ev)
+		}
+	}
+	if len(webhookEvents) != 6 {
+		t.Errorf("there are %d webhook events, want 6", len(webhookEvents))
 	}
 }

@@ -293,7 +293,8 @@ func (s *Server) mcpProposeWorkspaceRules(u *user, wsID, rules string) (string, 
 func (s *Server) mcpGetPermissions(u *user, pageID string) (string, error) {
 	var ws string
 	var trashed any
-	if err := s.db.QueryRow(`SELECT workspace_id, trashed_at FROM pages WHERE id = ?`, pageID).Scan(&ws, &trashed); err != nil {
+	var docGen int64
+	if err := s.db.QueryRow(`SELECT workspace_id, trashed_at, doc_gen FROM pages WHERE id = ?`, pageID).Scan(&ws, &trashed, &docGen); err != nil {
 		return "", fmt.Errorf("page %q not found", pageID)
 	}
 	canRead := s.canRead(u.ID, pageID) && s.credentialMayEnter(u, ws)
@@ -314,6 +315,9 @@ func (s *Server) mcpGetPermissions(u *user, pageID string) (string, error) {
 		"page_id": pageID, "workspace_id": ws, "my_role": role,
 		"can_read": canRead, "can_write": canWrite, "can_delete": canWrite,
 		"in_trash": trashed != nil, "read_only_reason": reason,
+		// The generation an agent has to send back as if_match_docgen to write
+		// against exactly this state of the page (see write_content).
+		"doc_gen": docGen,
 	})
 	if err != nil {
 		return "", err

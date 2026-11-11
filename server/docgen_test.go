@@ -384,3 +384,203 @@ func TestEditorCannotSeedFromABodyThatWasReplacedMeanwhile(t *testing.T) {
 		t.Fatalf("an editor holding the current body: err %v, hello %v", err, hello)
 	}
 }
+
+// --- if_match_docgen: the agent's optimistic concurrency guard --------------
+//
+// doc_gen numbers the documents (see docgen.go). Until this existed an agent
+// could read a page, be told what would change it, and write anyway — the
+// editor's stale-copy guard protected the browser and nobody else. These go
+// through mcpCall, the way an agent reaches the server, and read the result out
+// of the database rather than out of the tool's answer.
+
+func docGenOf(t *testing.T, s *Server, pageID string) int64 {
+	t.Helper()
+	var gen int64
+	if err := s.db.QueryRow(`SELECT doc_gen FROM pages WHERE id = ?`, pageID).Scan(&gen); err != nil {
+		t.Fatalf("doc_gen of %s: %v", pageID, err)
+	}
+	return gen
+}
+
+func contentOf(t *testing.T, s *Server, pageID string) string {
+	t.Helper()
+	var c string
+	if err := s.db.QueryRow(`SELECT content FROM pages WHERE id = ?`, pageID).Scan(&c); err != nil {
+		t.Fatalf("content of %s: %v", pageID, err)
+	}
+	return c
+}
+
+func revisionCountOf(t *testing.T, s *Server, pageID string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM page_revisions WHERE page_id = ?`, pageID).Scan(&n); err != nil {
+		t.Fatalf("revisions of %s: %v", pageID, err)
+	}
+	return n
+}
+
+// Zero is a generation like any other. A pointer, not an int, is what makes
+// that true: an int field would read 0 as "not given" and let a stale write
+// through the one case the guard exists for — a page nobody has rewritten yet.
+func TestIfMatchDocGenZeroGuardsAFreshPage(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "docgen-zero@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	page := s.makePage(t, s.firstWorkspaceOf(t, uid), uid, "", "Guarded", `{}`)
+	if gen := docGenOf(t, s, page); gen != 0 {
+		t.Fatalf("a fresh page starts at doc_gen %d, want 0", gen)
+	}
+
+	if _, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"first","if_match_docgen":0}`); err != nil {
+		t.Fatalf("if_match_docgen 0 on a fresh page was refused (%v) — 0 is a real generation, not \"unguarded\"", err)
+	}
+	if gen := docGenOf(t, s, page); gen != 1 {
+		t.Fatalf("after one guarded append doc_gen is %d, want 1", gen)
+	}
+	before := contentOf(t, s, page)
+	beforeRevs := revisionCountOf(t, s, page)
+
+	_, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"second","if_match_docgen":0}`)
+	if err == nil {
+		t.Fatal("a write naming the superseded doc_gen 0 was accepted")
+	}
+	if !strings.Contains(err.Error(), "409 Conflict") {
+		t.Errorf("refusal does not name 409 Conflict: %v", err)
+	}
+	if !strings.Contains(err.Error(), "doc_gen is 1 (expected 0)") {
+		t.Errorf("refusal does not say what the generation is: %v", err)
+	}
+	if got := contentOf(t, s, page); got != before {
+		t.Errorf("a refused write changed the content:\nbefore %s\nafter  %s", before, got)
+	}
+	if gen := docGenOf(t, s, page); gen != 1 {
+		t.Errorf("a refused write moved doc_gen to %d", gen)
+	}
+	if got := revisionCountOf(t, s, page); got != beforeRevs {
+		t.Errorf("a refused write filed %d revision(s)", got-beforeRevs)
+	}
+}
+
+// The guard has to hold in all three modes, and leaving it out has to keep the
+// old behaviour exactly — including that 0 and "not given" are different.
+func TestIfMatchDocGenGuardsEveryWriteMode(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "docgen-modes@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	page := s.makePage(t, s.firstWorkspaceOf(t, uid), uid, "", "Modes", `{}`)
+
+	// prepend, at the generation the page is at: accepted.
+	if _, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"top","mode":"prepend","if_match_docgen":0}`); err != nil {
+		t.Fatalf("guarded prepend: %v", err)
+	}
+	if gen := docGenOf(t, s, page); gen != 1 {
+		t.Fatalf("doc_gen after guarded prepend is %d, want 1", gen)
+	}
+	before := contentOf(t, s, page)
+	// prepend again against the old generation: refused, nothing moves.
+	if _, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"again","mode":"prepend","if_match_docgen":0}`); err == nil {
+		t.Fatal("a stale prepend was accepted")
+	}
+	if got := contentOf(t, s, page); got != before {
+		t.Errorf("a refused prepend changed the content")
+	}
+
+	// replace at the current generation: accepted; then stale: refused.
+	if _, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"whole body","mode":"replace","if_match_docgen":1}`); err != nil {
+		t.Fatalf("guarded replace: %v", err)
+	}
+	if gen := docGenOf(t, s, page); gen != 2 {
+		t.Fatalf("doc_gen after guarded replace is %d, want 2", gen)
+	}
+	before = contentOf(t, s, page)
+	beforeRevs := revisionCountOf(t, s, page)
+	if _, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"stale","mode":"replace","if_match_docgen":1}`); err == nil {
+		t.Fatal("a stale replace was accepted")
+	}
+	if got := contentOf(t, s, page); got != before {
+		t.Errorf("a refused replace changed the content")
+	}
+	if gen := docGenOf(t, s, page); gen != 2 {
+		t.Errorf("a refused replace moved doc_gen to %d", gen)
+	}
+	if got := revisionCountOf(t, s, page); got != beforeRevs {
+		t.Errorf("a refused replace filed %d revision(s)", got-beforeRevs)
+	}
+
+	// No guard at all: the old behaviour, unchanged.
+	if _, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"unguarded"}`); err != nil {
+		t.Fatalf("an unguarded append was refused: %v", err)
+	}
+	if gen := docGenOf(t, s, page); gen != 3 {
+		t.Errorf("doc_gen after an unguarded write is %d, want 3", gen)
+	}
+}
+
+func TestIfMatchDocGenRefusesNegativeGenerations(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "docgen-negative@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	page := s.makePage(t, s.firstWorkspaceOf(t, uid), uid, "", "Negative", `{}`)
+	before := contentOf(t, s, page)
+
+	_, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"x","if_match_docgen":-1}`)
+	if err == nil || !strings.Contains(err.Error(), "if_match_docgen must be >= 0") {
+		t.Fatalf("if_match_docgen -1 gave %v, want \"if_match_docgen must be >= 0\"", err)
+	}
+	if got := contentOf(t, s, page); got != before {
+		t.Error("a refused negative generation still wrote")
+	}
+	if gen := docGenOf(t, s, page); gen != 0 {
+		t.Errorf("doc_gen is %d after a refused write, want 0", gen)
+	}
+}
+
+// get_permissions is where an agent learns the number, so it has to be the
+// number the guard actually compares — not an approximation of it.
+func TestGetPermissionsReportsTheDocGenTheGuardUses(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "docgen-perm@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	page := s.makePage(t, s.firstWorkspaceOf(t, uid), uid, "", "Perms", `{}`)
+
+	out, err := callTool(t, s, u, "get_permissions", `{"page_id":"`+page+`"}`)
+	if err != nil {
+		t.Fatalf("get_permissions: %v", err)
+	}
+	var perms map[string]any
+	if err := json.Unmarshal([]byte(out), &perms); err != nil {
+		t.Fatalf("get_permissions is not JSON: %v\n%s", err, out)
+	}
+	if perms["doc_gen"] != float64(0) {
+		t.Fatalf("doc_gen is %v on a fresh page, want 0", perms["doc_gen"])
+	}
+
+	if _, err := callTool(t, s, u, "write_content", `{"page_id":"`+page+`","markdown":"body"}`); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	out, err = callTool(t, s, u, "get_permissions", `{"page_id":"`+page+`"}`)
+	if err != nil {
+		t.Fatalf("get_permissions: %v", err)
+	}
+	if err := json.Unmarshal([]byte(out), &perms); err != nil {
+		t.Fatalf("get_permissions is not JSON: %v", err)
+	}
+	gen := docGenOf(t, s, page)
+	if perms["doc_gen"] != float64(gen) {
+		t.Fatalf("get_permissions says doc_gen %v, the page is at %d", perms["doc_gen"], gen)
+	}
+	// The number it handed out is the one that lets the next write through.
+	if _, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"more","if_match_docgen":`+strconv.FormatInt(int64(perms["doc_gen"].(float64)), 10)+`}`); err != nil {
+		t.Fatalf("the doc_gen get_permissions reported was refused: %v", err)
+	}
+}

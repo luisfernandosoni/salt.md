@@ -80,6 +80,10 @@ func (s *Server) mcpUpdatePageMeta(pageID, title, icon, cover, description, visi
 	}
 	s.reindexPage(pageID)
 	s.pagesChanged()
+	// A row whose title/icon/cover changed is still a row: the board showing it
+	// has to redraw the card, and a receiver watching the database hears it.
+	s.rowChanged(pageID)
+	s.fireRowWebhook("row.updated", pageID, nil)
 	return fmt.Sprintf("Updated %s on page %s", strings.Join(changed, ", "), pageID), nil
 }
 
@@ -93,22 +97,46 @@ func (s *Server) mcpUpdatePageMeta(pageID, title, icon, cover, description, visi
 // CRDT. Whoever has the page open in the editor at that exact moment loses
 // their unsaved changes. That is why it is in the tool description too, so an
 // agent can weigh it up.
-func (s *Server) mcpReplaceContent(u *user, pageID, md string) (string, error) {
+//
+// ifMatchDocGen pins the write to a generation. The read, the revision and the
+// write all sit in one transaction, so a refused 409 leaves the content, the
+// doc_gen, the Yjs state and the page history exactly as they were.
+func (s *Server) mcpReplaceContent(u *user, pageID, md string, ifMatchDocGen *int64) (string, error) {
 	content, err := mdToBlocksJSON(md)
 	if err != nil {
 		return "", err
 	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var gen int64
+	var trashed sql.NullString
+	if err := tx.QueryRow(`SELECT doc_gen, trashed_at FROM pages WHERE id = ?`, pageID).Scan(&gen, &trashed); err != nil {
+		return "", fmt.Errorf("page %q not found", pageID)
+	}
+	if trashed.Valid {
+		return "", fmt.Errorf("page %q not found", pageID)
+	}
+	if ifMatchDocGen != nil && gen != *ifMatchDocGen {
+		return "", docGenConflict(pageID, gen, *ifMatchDocGen)
+	}
 	// Save the OLD state first, then overwrite. Without this a change made by an
 	// agent would be beyond recovery — and get_page_history would stay empty even
 	// though the agent just replaced half the page.
-	s.snapshotRevision(pageID, u.ID, u.Name)
-	res, err := s.db.Exec(`UPDATE pages SET content = ?, updated_at = ?, `+bumpDocGen+` WHERE id = ? AND trashed_at IS NULL`,
-		content, now(), pageID)
+	snapshotRevisionIn(tx, pageID, u.ID, u.Name)
+	res, err := tx.Exec(`UPDATE pages SET content = ?, updated_at = ?, `+bumpDocGen+` WHERE id = ? AND trashed_at IS NULL AND doc_gen = ?`,
+		content, now(), pageID, gen)
 	if err != nil {
 		return "", err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return "", fmt.Errorf("page %q not found", pageID)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
 	}
 	s.resetYjsDoc(pageID)
 	s.reindexPage(pageID)
@@ -119,12 +147,11 @@ func (s *Server) mcpReplaceContent(u *user, pageID, md string) (string, error) {
 
 // mcpPrependMarkdown puts Markdown BEFORE the existing content. Notion can do
 // that ("insert at start"), Salt could not until now.
-func (s *Server) mcpPrependMarkdown(u *user, pageID, md string) (string, error) {
+func (s *Server) mcpPrependMarkdown(u *user, pageID, md string, ifMatchDocGen *int64) (string, error) {
 	blocks := mdToBlocks(md)
 	if len(blocks) == 0 {
 		return "", fmt.Errorf("markdown is empty")
 	}
-	s.snapshotRevision(pageID, u.ID, u.Name) // save the old state first, see mcpReplaceContent
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", err
@@ -132,9 +159,14 @@ func (s *Server) mcpPrependMarkdown(u *user, pageID, md string) (string, error) 
 	defer tx.Rollback()
 
 	var content string
-	if err := tx.QueryRow(`SELECT content FROM pages WHERE id = ? AND trashed_at IS NULL`, pageID).Scan(&content); err != nil {
+	var gen int64
+	if err := tx.QueryRow(`SELECT content, doc_gen FROM pages WHERE id = ? AND trashed_at IS NULL`, pageID).Scan(&content, &gen); err != nil {
 		return "", fmt.Errorf("page %q not found", pageID)
 	}
+	if ifMatchDocGen != nil && gen != *ifMatchDocGen {
+		return "", docGenConflict(pageID, gen, *ifMatchDocGen)
+	}
+	snapshotRevisionIn(tx, pageID, u.ID, u.Name) // save the old state first, see mcpReplaceContent
 	var existing []json.RawMessage
 	if err := json.Unmarshal([]byte(content), &existing); err != nil {
 		existing = []json.RawMessage{}
@@ -151,7 +183,7 @@ func (s *Server) mcpPrependMarkdown(u *user, pageID, md string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	if _, err := tx.Exec(`UPDATE pages SET content = ?, updated_at = ?, `+bumpDocGen+` WHERE id = ?`, string(merged), now(), pageID); err != nil {
+	if _, err := tx.Exec(`UPDATE pages SET content = ?, updated_at = ?, `+bumpDocGen+` WHERE id = ? AND doc_gen = ?`, string(merged), now(), pageID, gen); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {

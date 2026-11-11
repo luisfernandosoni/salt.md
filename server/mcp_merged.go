@@ -23,17 +23,21 @@ import (
 // replace_content. The default is append, because it is the only one of the
 // three that cannot destroy anything: a missing mode should do the harmless
 // thing.
-func (s *Server) mcpWriteContent(u *user, pageID, markdown, mode string) (string, error) {
+//
+// ifMatchDocGen is the optional optimistic-concurrency guard: nil means
+// "write whatever is there", a number means "only if the page is still at this
+// generation". The distinction matters because 0 is a real generation.
+func (s *Server) mcpWriteContent(u *user, pageID, markdown, mode string, ifMatchDocGen *int64) (string, error) {
 	switch mode {
 	case "", "append":
-		if err := s.appendMarkdownToPage(pageID, markdown); err != nil {
+		if err := s.appendMarkdownToPage(pageID, markdown, ifMatchDocGen); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("Appended content to page %s", pageID), nil
 	case "prepend":
-		return s.mcpPrependMarkdown(u, pageID, markdown)
+		return s.mcpPrependMarkdown(u, pageID, markdown, ifMatchDocGen)
 	case "replace":
-		return s.mcpReplaceContent(u, pageID, markdown)
+		return s.mcpReplaceContent(u, pageID, markdown, ifMatchDocGen)
 	}
 	return "", fmt.Errorf("unknown mode %q — use append (the default), prepend or replace", mode)
 }
@@ -160,6 +164,15 @@ func (s *Server) mcpSetTrashed(pageID string, trashed *bool) (string, error) {
 	if err != nil || len(ids) == 0 {
 		return "", fmt.Errorf("page %q not found", pageID)
 	}
+	// Before the UPDATE: once a row is trashed its metadata is still readable,
+	// but reading it here keeps this path identical to the hard delete, which
+	// has no choice.
+	var rowMetas []rowWebhookMeta
+	for _, pid := range ids {
+		if m, ok := s.lookupCollectionRow(pid); ok {
+			rowMetas = append(rowMetas, m)
+		}
+	}
 	idArgs := make([]any, len(ids))
 	for i, v := range ids {
 		idArgs[i] = v
@@ -174,6 +187,15 @@ func (s *Server) mcpSetTrashed(pageID string, trashed *bool) (string, error) {
 		s.collab.reset(pid)
 	}
 	s.pagesChanged()
+	// The same events the REST delete path fires. Until this existed an agent
+	// moved a page to the trash and every receiver stayed quiet about it.
+	for _, pid := range ids {
+		s.rowChanged(pid)
+		s.fireWebhook("page.trashed", pid)
+	}
+	for _, m := range rowMetas {
+		s.fireRowWebhookMeta("row.deleted", m)
+	}
 	return fmt.Sprintf("Moved page %s (and %d sub-pages) to trash", pageID, len(ids)-1), nil
 }
 
