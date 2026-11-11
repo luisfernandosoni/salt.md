@@ -544,6 +544,93 @@ func TestIfMatchDocGenRefusesNegativeGenerations(t *testing.T) {
 	}
 }
 
+// An empty append is still a claim about the page. It used to answer nil before
+// reading anything, so a stale if_match_docgen "succeeded" and the agent
+// concluded its write had landed on the body it had read. The guard has to be
+// checked even when there is nothing to write — and an empty write at the
+// right generation has to stay the harmless no-op it is.
+func TestEmptyAppendIsHeldToTheGeneration(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "docgen-empty@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	page := s.makePage(t, s.firstWorkspaceOf(t, uid), uid, "", "Empty append", `{}`)
+
+	if _, err := callTool(t, s, u, "write_content", `{"page_id":"`+page+`","markdown":"seed"}`); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	if gen := docGenOf(t, s, page); gen != 1 {
+		t.Fatalf("doc_gen after the seed write is %d, want 1", gen)
+	}
+	before := contentOf(t, s, page)
+	beforeRevs := revisionCountOf(t, s, page)
+
+	_, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"","if_match_docgen":0}`)
+	if err == nil {
+		t.Fatal("an empty append naming the superseded doc_gen 0 was accepted — the guard was skipped because there was nothing to write")
+	}
+	if !strings.Contains(err.Error(), "409 Conflict") {
+		t.Errorf("refusal does not name 409 Conflict: %v", err)
+	}
+	if !strings.Contains(err.Error(), "doc_gen is 1 (expected 0)") {
+		t.Errorf("refusal does not say what the generation is: %v", err)
+	}
+	if got := contentOf(t, s, page); got != before {
+		t.Errorf("a refused empty append changed the content")
+	}
+
+	// At the current generation the same call is a no-op, not an error.
+	if _, err := callTool(t, s, u, "write_content",
+		`{"page_id":"`+page+`","markdown":"","if_match_docgen":1}`); err != nil {
+		t.Fatalf("an empty append at the current generation was refused: %v", err)
+	}
+	if got := contentOf(t, s, page); got != before {
+		t.Errorf("an empty append changed the content")
+	}
+	if gen := docGenOf(t, s, page); gen != 1 {
+		t.Errorf("an empty append moved doc_gen to %d", gen)
+	}
+	if got := revisionCountOf(t, s, page); got != beforeRevs {
+		t.Errorf("an empty append filed %d revision(s)", got-beforeRevs)
+	}
+}
+
+// The trash is a place a page is not. replace and prepend already refused it;
+// append did not, so an agent could write into a page somebody had thrown away
+// and be told it worked. The empty case is the same claim about the same page —
+// "not found", never a quiet success.
+func TestAppendRefusesATrashedPageEvenWhenEmpty(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "docgen-trashed@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	page := s.makePage(t, s.firstWorkspaceOf(t, uid), uid, "", "Trashed", `{}`)
+	if _, err := callTool(t, s, u, "write_content", `{"page_id":"`+page+`","markdown":"body"}`); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	if _, err := callTool(t, s, u, "set_trashed", `{"page_id":"`+page+`","trashed":true}`); err != nil {
+		t.Fatalf("set_trashed: %v", err)
+	}
+	before := contentOf(t, s, page)
+	beforeGen := docGenOf(t, s, page)
+
+	for _, md := range []string{"more", "", "   \n\n"} {
+		_, err := callTool(t, s, u, "write_content",
+			`{"page_id":"`+page+`","markdown":`+strconv.Quote(md)+`}`)
+		if err == nil {
+			t.Fatalf("an append of %q to a trashed page was accepted", md)
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("an append of %q to a trashed page gave %v, want \"not found\"", md, err)
+		}
+	}
+	if got := contentOf(t, s, page); got != before {
+		t.Errorf("a refused append to a trashed page changed the content")
+	}
+	if gen := docGenOf(t, s, page); gen != beforeGen {
+		t.Errorf("a refused append to a trashed page moved doc_gen to %d", gen)
+	}
+}
+
 // get_permissions is where an agent learns the number, so it has to be the
 // number the guard actually compares — not an approximation of it.
 func TestGetPermissionsReportsTheDocGenTheGuardUses(t *testing.T) {
