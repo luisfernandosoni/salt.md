@@ -330,7 +330,12 @@ func mdToBlocksJSON(md string) (string, error) {
 // content, refreshes the index, and resets any live CRDT doc so open
 // editors reload the new content. The read-modify-write runs in a
 // transaction so concurrent appends can't clobber each other.
-func (s *Server) appendMarkdownToPage(pageID, md string) error {
+//
+// ifMatchDocGen, when given, holds the write to the generation the caller
+// saw: the page is read inside the same transaction that writes it, and a
+// mismatch refuses before anything moves — no content, no doc_gen, no Yjs
+// reset, and no revision (the snapshot happens after the commit).
+func (s *Server) appendMarkdownToPage(pageID, md string, ifMatchDocGen *int64) error {
 	blocks := mdToBlocks(md)
 	if len(blocks) == 0 {
 		return nil // nothing to append; don't disturb open editors
@@ -342,8 +347,12 @@ func (s *Server) appendMarkdownToPage(pageID, md string) error {
 	defer tx.Rollback()
 
 	var content string
-	if err := tx.QueryRow(`SELECT content FROM pages WHERE id = ?`, pageID).Scan(&content); err != nil {
+	var gen int64
+	if err := tx.QueryRow(`SELECT content, doc_gen FROM pages WHERE id = ?`, pageID).Scan(&content, &gen); err != nil {
 		return err
+	}
+	if ifMatchDocGen != nil && gen != *ifMatchDocGen {
+		return docGenConflict(pageID, gen, *ifMatchDocGen)
 	}
 	var existing []json.RawMessage
 	if err := json.Unmarshal([]byte(content), &existing); err != nil {
@@ -360,7 +369,7 @@ func (s *Server) appendMarkdownToPage(pageID, md string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE pages SET content = ?, updated_at = ?, `+bumpDocGen+` WHERE id = ?`, string(merged), now(), pageID); err != nil {
+	if _, err := tx.Exec(`UPDATE pages SET content = ?, updated_at = ?, `+bumpDocGen+` WHERE id = ? AND doc_gen = ?`, string(merged), now(), pageID, gen); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

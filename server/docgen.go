@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -85,6 +86,13 @@ func materializeGuard(r *http.Request) (clause string, args []any, ok bool) {
 		return "", nil, false
 	}
 	return " AND doc_gen = ?", []any{gen}, true
+}
+
+// docGenConflict is the refusal an outside write makes when the page has moved
+// on since the caller looked at it. Same shape and same 409 marker as the
+// editor's doc_replaced answer, so a caller can branch on it either way.
+func docGenConflict(pageID string, actual, expected int64) error {
+	return fmt.Errorf("409 Conflict: page %q doc_gen is %d (expected %d) — fetch latest page state before writing", pageID, actual, expected)
 }
 
 // keepRefusedCopy files an editor's refused copy in the page history. It is a

@@ -23,23 +23,31 @@ const revisionKeep = 50                  // keep the newest N per page
 // unless the newest revision is younger than revisionThrottle. Best-effort:
 // history is a convenience, never blocks the write path.
 func (s *Server) snapshotRevision(pageID, authorID, authorName string) {
+	snapshotRevisionIn(s.db, pageID, authorID, authorName)
+}
+
+// snapshotRevisionIn is snapshotRevision against a given handle, so a guarded
+// outside write can file the revision INSIDE the transaction that may refuse
+// it: a 409 has to leave zero revisions behind, and a write issued on s.db
+// while a tx holds the single connection would deadlock.
+func snapshotRevisionIn(q querier, pageID, authorID, authorName string) {
 	var last string
-	if s.db.QueryRow(`SELECT created_at FROM page_revisions WHERE page_id = ? ORDER BY created_at DESC LIMIT 1`, pageID).Scan(&last) == nil {
+	if q.QueryRow(`SELECT created_at FROM page_revisions WHERE page_id = ? ORDER BY created_at DESC LIMIT 1`, pageID).Scan(&last) == nil {
 		if t, err := time.Parse(time.RFC3339Nano, last); err == nil && time.Since(t) < revisionThrottle {
 			return
 		}
 	}
 	var title, content string
-	if s.db.QueryRow(`SELECT title, content FROM pages WHERE id = ?`, pageID).Scan(&title, &content) != nil {
+	if q.QueryRow(`SELECT title, content FROM pages WHERE id = ?`, pageID).Scan(&title, &content) != nil {
 		return
 	}
 	if strings.TrimSpace(content) == "" || content == "[]" {
 		return // don't snapshot an empty doc
 	}
-	s.db.Exec(`INSERT INTO page_revisions (id, page_id, created_at, author_id, author_name, title, content) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	q.Exec(`INSERT INTO page_revisions (id, page_id, created_at, author_id, author_name, title, content) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		newID(), pageID, now(), authorID, authorName, title, content)
 	// Prune to the newest revisionKeep for this page.
-	s.db.Exec(`DELETE FROM page_revisions WHERE page_id = ? AND id NOT IN (
+	q.Exec(`DELETE FROM page_revisions WHERE page_id = ? AND id NOT IN (
 		SELECT id FROM page_revisions WHERE page_id = ? ORDER BY created_at DESC LIMIT ?)`, pageID, pageID, revisionKeep)
 }
 

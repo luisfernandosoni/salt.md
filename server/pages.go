@@ -367,6 +367,7 @@ func (s *Server) handleCreatePage(w http.ResponseWriter, r *http.Request) {
 	s.pagesChanged()
 	s.rowChanged(id)
 	s.fireWebhook("page.created", id)
+	s.fireRowWebhook("row.created", id, nil)
 	writeJSON(w, p)
 }
 
@@ -502,6 +503,10 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 	args := []any{now()}
 	metaChanged := false
 	auditProps := ""
+	// The property keys this request touches, for row.updated's
+	// changedProperties. Sorted, so the payload does not depend on Go's map
+	// order.
+	changedProps := []string{}
 
 	if body.IsTemplate != nil {
 		v := 0
@@ -581,6 +586,12 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 		sets = append(sets, "props = ?")
 		args = append(args, string(body.Props))
 		metaChanged = true
+		var sent map[string]json.RawMessage
+		if json.Unmarshal(body.Props, &sent) == nil {
+			for k := range sent {
+				changedProps = append(changedProps, k)
+			}
+		}
 	}
 
 	// A new parent needs write permission on that parent AND the same workspace.
@@ -652,6 +663,9 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 		sets = append(sets, "props = ?")
 		args = append(args, string(mergedJSON))
 		metaChanged = true
+		for k := range patch {
+			changedProps = append(changedProps, k)
+		}
 
 		// Record WHAT changed, not just that something did.
 		//
@@ -779,6 +793,11 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 	// — a receiver wants "this page changed", not our internal split.
 	if len(body.Content) > 0 || metaChanged {
 		s.fireWebhook("page.updated", id)
+	}
+	// A row that is not a row (a document, a collection) is filtered out by the
+	// lookup, so this is quiet where it should be.
+	if metaChanged || len(body.Props) > 0 || len(body.PropsPatch) > 0 {
+		s.fireRowWebhook("row.updated", id, changedProps)
 	}
 	p, err := s.getPage(id)
 	if err != nil {
@@ -931,6 +950,22 @@ func (s *Server) handleDeletePage(w http.ResponseWriter, r *http.Request) {
 		action = "delete_page"
 	}
 	s.audit("human", requestUser(r).ID, requestUser(r).Name, action, id, s.pageWorkspace(id), "")
+	// The row metadata has to be captured BEFORE the transaction opens: a hard
+	// delete removes the pages rows, so after the commit there is nothing left
+	// to look up and row.deleted would arrive with an empty collectionId.
+	// Reading it first also keeps the lookups off the open transaction — there
+	// is one connection.
+	preIDs, err := subtreeIDs(s.db, id)
+	if err != nil {
+		httpError(w, 500, err.Error())
+		return
+	}
+	var rowMetas []rowWebhookMeta
+	for _, pid := range preIDs {
+		if m, ok := s.lookupCollectionRow(pid); ok {
+			rowMetas = append(rowMetas, m)
+		}
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		httpError(w, 500, err.Error())
@@ -1007,6 +1042,12 @@ func (s *Server) handleDeletePage(w http.ResponseWriter, r *http.Request) {
 	// would otherwise never hear that it went, because only the root was named.
 	for _, pid := range ids {
 		s.fireWebhook("page.trashed", pid)
+	}
+	// And the rows of any database in the subtree, with the collection they
+	// belonged to — which is exactly why the metadata was read before the
+	// delete. A page that is not a row never got into rowMetas.
+	for _, m := range rowMetas {
+		s.fireRowWebhookMeta("row.deleted", m)
 	}
 	writeJSON(w, map[string]bool{"ok": true})
 }

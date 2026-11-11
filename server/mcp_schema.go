@@ -724,6 +724,14 @@ func (s *Server) mcpCreateRows(userID, pageID string, rows json.RawMessage) (str
 	}
 	s.pagesChanged()
 	s.rowsChanged(pageID)
+	// A row is a page, so it reports both ways: page.created for a receiver
+	// watching the tree, row.created for one watching THIS database. Every id,
+	// not just the database — the wiki says so, and a check in
+	// webhooks_test.go holds the two to each other.
+	for _, id := range ids {
+		s.fireWebhook("page.created", id)
+		s.fireRowWebhook("row.created", id, nil)
+	}
 	b, _ := json.Marshal(map[string]any{"created": len(ids), "ids": ids})
 	return string(b), nil
 }

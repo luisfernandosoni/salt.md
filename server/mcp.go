@@ -310,9 +310,10 @@ var mcpTools = []map[string]any{
 		"description": "Write Markdown into a page. mode: append (the default — adds at the end) | prepend (adds at the top) | replace (replaces the whole body). " + pageLinkHint + " " + diagramHint,
 		"inputSchema": map[string]any{"type": "object",
 			"properties": map[string]any{
-				"page_id":  map[string]any{"type": "string"},
-				"markdown": map[string]any{"type": "string"},
-				"mode":     map[string]any{"type": "string", "description": "append (default) | prepend | replace. replace overwrites the body and bypasses the realtime editor, so anyone with the page open loses unsaved edits — prefer append."},
+				"page_id":         map[string]any{"type": "string"},
+				"markdown":        map[string]any{"type": "string"},
+				"mode":            map[string]any{"type": "string", "description": "append (default) | prepend | replace. replace overwrites the body and bypasses the realtime editor, so anyone with the page open loses unsaved edits — prefer append."},
+				"if_match_docgen": map[string]any{"type": "integer", "description": "Optional optimistic concurrency guard: expected doc_gen of the page (>= 0, from get_permissions). Refuses with 409 Conflict if doc_gen has changed."},
 			},
 			"required": []string{"page_id", "markdown"}},
 	},
@@ -761,6 +762,11 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 		Action  string `json:"action"`
 		Public  *bool  `json:"public"`
 		Trashed *bool  `json:"trashed"`
+		// A POINTER for the same reason ParentID is one: doc_gen 0 is the valid
+		// generation of a page whose body has never been replaced from outside,
+		// so the zero value cannot mean "not guarded". nil = unguarded,
+		// 0 = the page must still be at doc_gen 0.
+		IfMatchDocGen *int64 `json:"if_match_docgen"`
 		// list(kind:) — one tool for the seven former list_* tools.
 		Kind string `json:"kind"`
 		// Graph.
@@ -983,6 +989,8 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 			}
 			s.pagesChanged()
 			s.fireWebhook("page.created", id)
+			s.rowChanged(id)
+			s.fireRowWebhook("row.created", id, nil)
 			return fmt.Sprintf("Created page %q with id %s (path: /p/%s)", args.Title, id, id), nil
 		case "update_page":
 			// Moving and favouriting are metadata changes and used to be tools of
@@ -1208,7 +1216,10 @@ func (s *Server) mcpCall(u *user, name string, rawArgs json.RawMessage, publicBa
 		case "save_as_template":
 			return s.mcpSaveAsTemplate(u, args.PageID)
 		case "write_content":
-			return s.mcpWriteContent(u, args.PageID, args.Markdown, args.Mode)
+			if args.IfMatchDocGen != nil && *args.IfMatchDocGen < 0 {
+				return "", fmt.Errorf("if_match_docgen must be >= 0")
+			}
+			return s.mcpWriteContent(u, args.PageID, args.Markdown, args.Mode, args.IfMatchDocGen)
 		case "revisions":
 			return s.mcpRevisions(u, args.PageID, args.Action, args.RevisionID, args.Limit)
 		case "comments":
