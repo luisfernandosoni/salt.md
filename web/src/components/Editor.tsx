@@ -1652,7 +1652,10 @@ function CollabEditor({ page, user, theme, canEdit, onReset, ...rest }: CollabPr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page.id]);
 
-  if (!provider || !ready) return <div className="editor-loading" />;
+  if (!provider || !ready) {
+    if (isEffectivelyEmpty(page.content)) return <div className="editor-loading" />;
+    return <InstantPagePreview blocks={page.content} />;
+  }
   return (
     <BlockContent
       provider={provider}
@@ -1673,6 +1676,246 @@ function isEffectivelyEmpty(doc: unknown[]): boolean {
   if (doc.length > 1) return false;
   const b = doc[0] as { type?: string; content?: unknown[] };
   return b?.type === 'paragraph' && (!b.content || b.content.length === 0);
+}
+
+// ---- Read-only first paint ----
+//
+// GET /api/pages/{id} already carries page.content, while the /collab socket
+// still has to replay every stored frame before it says {"synced":true}. On a
+// large page over a slow link that is seconds of blank screen with the text
+// already in memory. This draws those blocks until ready flips, then unmounts.
+//
+// It reads props only. It never mounts the editor, never seeds a document and
+// never calls into Yjs, so the live document is exactly what the server says it
+// is when the real editor takes over.
+type PreviewBlock = {
+  id?: string;
+  type?: string;
+  props?: Record<string, unknown>;
+  content?: unknown;
+  children?: PreviewBlock[];
+};
+
+const previewHeadingSize: Record<number, string> = { 1: '1.9em', 2: '1.45em', 3: '1.2em' };
+
+function previewInline(content: unknown): React.ReactNode {
+  if (!Array.isArray(content)) return null;
+  return content.map((raw, i) => {
+    const node = raw as {
+      type?: string;
+      text?: string;
+      href?: string;
+      styles?: Record<string, boolean>;
+      content?: unknown;
+      props?: Record<string, unknown>;
+    };
+    if (node?.type === 'link') {
+      return (
+        <a key={i} href={String(node.href ?? '#')} rel="noreferrer noopener" target="_blank">
+          {previewInline(node.content)}
+        </a>
+      );
+    }
+    if (node?.type === 'pageLink') {
+      const label = String(node.props?.label ?? '');
+      return (
+        <span key={i} style={{ color: 'var(--accent)' }}>
+          {label || t('Untitled')}
+        </span>
+      );
+    }
+    const text = String(node?.text ?? '');
+    if (!text) return null;
+    const s = node?.styles ?? {};
+    let out: React.ReactNode = text;
+    if (s.code) out = <code key={i} style={{ background: 'var(--hover)', borderRadius: 4, padding: '0 3px' }}>{out}</code>;
+    if (s.italic) out = <em key={i}>{out}</em>;
+    if (s.bold) out = <strong key={i}>{out}</strong>;
+    if (s.underline) out = <u key={i}>{out}</u>;
+    if (s.strike) out = <s key={i}>{out}</s>;
+    return <span key={i}>{out}</span>;
+  });
+}
+
+function previewText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((raw) => {
+      const n = raw as { text?: string; content?: unknown };
+      return n?.text ?? previewText(n?.content);
+    })
+    .join('');
+}
+
+function PreviewBlocks({ blocks }: { blocks: PreviewBlock[] }) {
+  return (
+    <>
+      {blocks.map((block, i) => (
+        <PreviewBlockView key={block.id ?? i} block={block} />
+      ))}
+    </>
+  );
+}
+
+function PreviewBlockView({ block }: { block: PreviewBlock }) {
+  const children = block.children?.length ? <PreviewBlocks blocks={block.children} /> : null;
+  const inline = previewInline(block.content);
+  const props = block.props ?? {};
+
+  switch (block.type) {
+    case 'heading': {
+      const level = Number(props.level ?? 1);
+      return (
+        <>
+          <div
+            style={{
+              fontSize: previewHeadingSize[level] ?? '1.1em',
+              fontWeight: 650,
+              lineHeight: 1.25,
+              margin: '0.7em 0 0.2em',
+            }}
+          >
+            {inline}
+          </div>
+          {children}
+        </>
+      );
+    }
+    case 'bulletListItem':
+    case 'numberedListItem':
+      return (
+        <div style={{ display: 'list-item', marginLeft: '1.4em', listStyleType: block.type === 'bulletListItem' ? 'disc' : 'decimal' }}>
+          {inline}
+          {children}
+        </div>
+      );
+    case 'checkListItem':
+      return (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+          <input type="checkbox" checked={Boolean(props.checked)} readOnly tabIndex={-1} style={{ marginTop: '0.35em' }} />
+          <div>
+            {inline}
+            {children}
+          </div>
+        </div>
+      );
+    case 'codeBlock':
+      return (
+        <pre
+          style={{
+            background: 'var(--hover)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            padding: '12px 14px',
+            overflowX: 'auto',
+            whiteSpace: 'pre-wrap',
+            fontSize: '0.9em',
+          }}
+        >
+          <code>{previewText(block.content)}</code>
+        </pre>
+      );
+    case 'callout':
+      return (
+        <div
+          style={{
+            display: 'flex',
+            gap: 10,
+            background: 'var(--hover)',
+            border: '1px solid var(--border)',
+            borderRadius: 10,
+            padding: '12px 14px',
+            margin: '0.5em 0',
+          }}
+        >
+          <span>{String(props.emoji ?? '💡')}</span>
+          <div>
+            {inline}
+            {children}
+          </div>
+        </div>
+      );
+    case 'quote':
+      return (
+        <blockquote
+          style={{
+            borderLeft: '3px solid var(--border-strong)',
+            margin: '0.6em 0',
+            paddingLeft: 14,
+            color: 'var(--muted)',
+          }}
+        >
+          {inline}
+          {children}
+        </blockquote>
+      );
+    case 'divider':
+      return <hr style={{ border: 0, borderTop: '1px solid var(--border)', margin: '1em 0' }} />;
+    case 'mermaid': {
+      const svg = String(props.svg ?? '');
+      if (!svg) return null;
+      return (
+        <img
+          src={`data:image/svg+xml;utf8,${encodeURIComponent(svg)}`}
+          alt=""
+          style={{ maxWidth: '100%', height: 'auto', display: 'block', margin: '0.6em 0' }}
+        />
+      );
+    }
+    case 'table': {
+      const rows = (block.content as { rows?: { cells?: unknown[] }[] } | undefined)?.rows ?? [];
+      return (
+        <table style={{ borderCollapse: 'collapse', width: '100%', margin: '0.6em 0' }}>
+          <tbody>
+            {rows.map((row, r) => (
+              <tr key={r}>
+                {(row.cells ?? []).map((cell, c) => {
+                  const inner = Array.isArray(cell) ? cell : (cell as { content?: unknown })?.content;
+                  return (
+                    <td key={c} style={{ border: '1px solid var(--border)', padding: '6px 10px', verticalAlign: 'top' }}>
+                      {previewInline(inner)}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      );
+    }
+    case 'image': {
+      const url = String(props.url ?? '');
+      if (!url) return null;
+      return <img src={url} alt="" style={{ maxWidth: '100%', height: 'auto' }} />;
+    }
+    default:
+      return (
+        <>
+          <div>{inline}</div>
+          {children}
+        </>
+      );
+  }
+}
+
+// The block container that gives the preview the same measure as the editor.
+function InstantPagePreview({ blocks }: { blocks: unknown[] }) {
+  return (
+    <div
+      className="instant-preview"
+      aria-busy="true"
+      style={{
+        flex: 1,
+        maxWidth: 720,
+        margin: '0 auto',
+        padding: '0 24px 120px',
+        lineHeight: 1.6,
+        opacity: 0.85,
+      }}
+    >
+      <PreviewBlocks blocks={blocks as PreviewBlock[]} />
+    </div>
+  );
 }
 
 function BlockContent({
