@@ -681,6 +681,11 @@ function PersonValue({ def, value, onChange, readOnly, compact }: Props) {
 // relation cells doesn't issue one request per cell.
 export type RelOption = { id: string; title: string; icon: string };
 const relCache = new Map<string, Promise<RelOption[]>>();
+// The resolved rows, kept beside the promise so a cell can paint its chips on
+// the first render instead of waiting one async tick for a .then. A 247-row
+// table queues hundreds of those ticks during mount.
+const relLists = new Map<string, RelOption[]>();
+const relMaps = new Map<string, Map<string, RelOption>>();
 
 // Exported because the board groups by relation too, and it must show the same
 // titles the cells show — loaded once through the same cache rather than
@@ -689,13 +694,22 @@ export function loadRelationOptions(colId: string, force = false): Promise<RelOp
   if (force || !relCache.has(colId)) {
     const p = api
       .collectionRows(colId, { limit: 500 })
-      .then((r) => r.rows.map((x) => ({ id: x.id, title: x.title, icon: x.icon })))
+      .then((r) => {
+        const list = r.rows.map((x) => ({ id: x.id, title: x.title, icon: x.icon }));
+        relLists.set(colId, list);
+        relMaps.set(colId, new Map(list.map((o) => [o.id, o])));
+        return list;
+      })
       .catch(() => {
         // Forget the failure. Caching it meant one hiccup — a restart mid-load,
         // a dropped connection — left every chip in every relation cell reading
         // "Untitled" until the tab was reloaded, because the empty list stayed
         // in the cache and nothing ever asked again.
-        if (relCache.get(colId) === p) relCache.delete(colId);
+        if (relCache.get(colId) === p) {
+          relCache.delete(colId);
+          relLists.delete(colId);
+          relMaps.delete(colId);
+        }
         return [] as RelOption[];
       });
     relCache.set(colId, p);
@@ -706,11 +720,19 @@ export function loadRelationOptions(colId: string, force = false): Promise<RelOp
 function RelationValue({ def, value, onChange, readOnly, compact, maxChips }: Props) {
   const targetId = def.relationCollection;
   const ids = idList(value);
-  const [options, setOptions] = useState<RelOption[]>([]);
+  const hasIds = ids.length > 0;
+  // Seeded from the cache so a cell that already has its rows renders the real
+  // title immediately. An empty target is the empty array, not a spinner.
+  const [options, setOptions] = useState<RelOption[]>(() =>
+    targetId ? relLists.get(targetId) ?? [] : [],
+  );
+  const [optionMap, setOptionMap] = useState<Map<string, RelOption> | null>(() =>
+    targetId ? relMaps.get(targetId) ?? null : null,
+  );
   // Whether the titles have ARRIVED, which is a different question from whether
   // there are any. It separates "still coming" from "asked, and this row was not
   // in the answer" — two states that both used to render as the word "Untitled".
-  const [loaded, setLoaded] = useState(false);
+  const [loaded, setLoaded] = useState<boolean>(() => Boolean(targetId && relMaps.has(targetId)));
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const boxRef = useRef<HTMLDivElement>(null);
@@ -718,16 +740,31 @@ function RelationValue({ def, value, onChange, readOnly, compact, maxChips }: Pr
 
   useEffect(() => {
     if (!targetId) return;
+    if (relMaps.has(targetId)) {
+      setOptions(relLists.get(targetId) ?? []);
+      setOptionMap(relMaps.get(targetId) ?? null);
+      setLoaded(true);
+      return;
+    }
+    // An empty cell that nobody is editing has nothing to show and nothing to
+    // ask for. The picker loads the list when it opens.
+    if (!hasIds && !open) {
+      setOptions([]);
+      setOptionMap(null);
+      setLoaded(false);
+      return;
+    }
     let alive = true;
     void loadRelationOptions(targetId).then((o) => {
       if (!alive) return;
       setOptions(o);
+      setOptionMap(relMaps.get(targetId) ?? null);
       setLoaded(true);
     });
     return () => {
       alive = false;
     };
-  }, [targetId]);
+  }, [targetId, open, hasIds]);
 
   useEffect(() => {
     if (!open) return;
@@ -750,11 +787,11 @@ function RelationValue({ def, value, onChange, readOnly, compact, maxChips }: Pr
   // may not read, a relation left pointing at something deleted. None of those
   // is a row called Untitled.
   const titleOf = (id: string) => {
-    const hit = options.find((o) => o.id === id);
+    const hit = optionMap?.get(id);
     if (!hit) return '';
     return hit.title || t('Untitled');
   };
-  const iconOf = (id: string) => options.find((o) => o.id === id)?.icon || '';
+  const iconOf = (id: string) => optionMap?.get(id)?.icon || '';
 
   if (!targetId) return <span className="prop-empty">{t('No target')}</span>;
 
@@ -811,7 +848,12 @@ function RelationValue({ def, value, onChange, readOnly, compact, maxChips }: Pr
         type="button"
         className="relation-open"
         onClick={() => {
-          if (!open && targetId) void loadRelationOptions(targetId, true).then(setOptions);
+          if (!open && targetId) {
+            void loadRelationOptions(targetId, true).then((o) => {
+              setOptions(o);
+              setOptionMap(relMaps.get(targetId) ?? null);
+            });
+          }
           setOpen((v) => !v);
         }}
       >
