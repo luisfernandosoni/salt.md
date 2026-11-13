@@ -20,29 +20,32 @@ import (
 type Server struct {
 	publicCSS string
 	db        *sql.DB
-	mux       *http.ServeMux
-	dataDir   string
+	// The read-only pool. Nil on an in-memory database; readDB always does the
+	// right thing either way.
+	rdb     *sql.DB
+	mux     *http.ServeMux
+	dataDir string
 	// name → the markup INSIDE a Lucide <svg>, for the print view.
 	lucide map[string]string
 	// The third-party licence notices, embedded from the repository root.
-	notices     string
-	addr        string
-	tunnel      tunnelState
+	notices string
+	addr    string
+	tunnel  tunnelState
 	// What the settings show about the cloudflared in use (tunnel_update.go).
 	cloudflared cloudflaredUpdates
 	// Agent keys from listed addresses only; see agent_addresses.go.
 	agentAddressList addressList
-	loginMu     sync.Mutex
-	loginSem    chan struct{}
-	events      *eventHub
-	collab      *collabHub
-	mcpRate     *rateLimiter
-	mcpIcon     string          // data URI of the logo for serverInfo.icons (see mcp.go)
-	ingest      *ingestRegistry // bulk imports in flight (see ingest.go)
-	loginRate   *rateLimiter
-	tokenRate   *rateLimiter
-	formRate    *rateLimiter
-	sharePwRate *rateLimiter
+	loginMu          sync.Mutex
+	loginSem         chan struct{}
+	events           *eventHub
+	collab           *collabHub
+	mcpRate          *rateLimiter
+	mcpIcon          string          // data URI of the logo for serverInfo.icons (see mcp.go)
+	ingest           *ingestRegistry // bulk imports in flight (see ingest.go)
+	loginRate        *rateLimiter
+	tokenRate        *rateLimiter
+	formRate         *rateLimiter
+	sharePwRate      *rateLimiter
 	// Refresh tokens replaced a moment ago, by the hash of the old one; see
 	// oauthRefresh.
 	renewMu     sync.Mutex
@@ -69,7 +72,19 @@ func (s *Server) Close() error {
 	default:
 		close(s.stopCleanup)
 	}
+	if s.rdb != nil {
+		s.rdb.Close()
+	}
 	return s.db.Close()
+}
+
+// readDB is the pool for queries that only read. Falls back to the writer when
+// no read-only pool exists (in-memory databases).
+func (s *Server) readDB() *sql.DB {
+	if s.rdb != nil {
+		return s.rdb
+	}
+	return s.db
 }
 
 // DBFile is the name of the SQLite file.
@@ -83,6 +98,7 @@ func New(dataDir string, dist fs.FS) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	rdb := openReadDB(filepath.Join(dataDir, DBFile))
 
 	// The logo is read ONCE at startup out of the embedded build and kept as a
 	// data URI. A data URI rather than a link, because some MCP clients will
@@ -114,6 +130,7 @@ func New(dataDir string, dist fs.FS) (*Server, error) {
 		lucide:    lucideSet,
 		ingest:    newIngestRegistry(),
 		db:        db,
+		rdb:       rdb,
 		mux:       http.NewServeMux(),
 		dataDir:   dataDir,
 		loginSem:  make(chan struct{}, 4),
@@ -122,8 +139,8 @@ func New(dataDir string, dist fs.FS) (*Server, error) {
 		mcpRate:   newRateLimiter(240, 60), // 240 writes/min per token, burst 60
 		loginRate: newRateLimiter(30, 10),  // 30 login attempts/min per IP, burst 10
 		// Fed by REJECTED tokens only, so a working agent never touches it.
-		tokenRate:   newRateLimiter(60, 20),
-		formRate:    newRateLimiter(20, 8), // 20 public form submits/min per IP, burst 8
+		tokenRate: newRateLimiter(60, 20),
+		formRate:  newRateLimiter(20, 8), // 20 public form submits/min per IP, burst 8
 		// Passwords on shared pages, per link and address. A share password was
 		// checked as fast as anybody could send guesses.
 		sharePwRate: newRateLimiter(10, 5),
