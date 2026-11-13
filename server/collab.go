@@ -463,7 +463,7 @@ func (s *Server) handleCollab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var exists int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pages WHERE id = ? AND trashed_at IS NULL`, pageID).Scan(&exists); err != nil || exists == 0 {
+	if err := s.readDB().QueryRow(`SELECT COUNT(*) FROM pages WHERE id = ? AND trashed_at IS NULL`, pageID).Scan(&exists); err != nil || exists == 0 {
 		httpError(w, 404, "page not found")
 		return
 	}
@@ -488,7 +488,7 @@ func (s *Server) handleCollab(w http.ResponseWriter, r *http.Request) {
 	// hundred one-character updates and by ignoring the snapshot request,
 	// and the honest editor that would have compacted it never got in.
 	var stored int
-	s.db.QueryRow(`SELECT COUNT(*) FROM yjs_updates WHERE page_id = ?`, pageID).Scan(&stored)
+	s.readDB().QueryRow(`SELECT COUNT(*) FROM yjs_updates WHERE page_id = ?`, pageID).Scan(&stored)
 	conn := &collabConn{ws: ws, out: make(chan outMsg, outBuffer+stored), done: make(chan struct{}), aware: map[uint64]uint64{}, userID: requestUser(r).ID}
 	go conn.writeLoop(ctx)
 	go conn.pingLoop(ctx)
@@ -516,14 +516,14 @@ func (s *Server) handleCollab(w http.ResponseWriter, r *http.Request) {
 	}
 	var snapshot []byte
 	var stateSeq int64
-	haveState := s.db.QueryRow(`SELECT snapshot, seq FROM yjs_state WHERE page_id = ?`, pageID).Scan(&snapshot, &stateSeq) == nil
+	haveState := s.readDB().QueryRow(`SELECT snapshot, seq FROM yjs_state WHERE page_id = ?`, pageID).Scan(&snapshot, &stateSeq) == nil
 
 	type upd struct {
 		seq  int64
 		data []byte
 	}
 	var updates []upd
-	if rows, err := s.db.Query(`SELECT seq, data FROM yjs_updates WHERE page_id = ? ORDER BY seq`, pageID); err == nil {
+	if rows, err := s.readDB().Query(`SELECT seq, data FROM yjs_updates WHERE page_id = ? ORDER BY seq`, pageID); err == nil {
 		for rows.Next() {
 			var u upd
 			if rows.Scan(&u.seq, &u.data) == nil {

@@ -31,7 +31,7 @@ func (s *Server) handleGetCollection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var schema, views string
-	err := s.db.QueryRow(`SELECT schema, views FROM collections WHERE page_id = ?`, r.PathValue("id")).Scan(&schema, &views)
+	err := s.readDB().QueryRow(`SELECT schema, views FROM collections WHERE page_id = ?`, r.PathValue("id")).Scan(&schema, &views)
 	if err == sql.ErrNoRows {
 		httpError(w, 404, "not a collection")
 		return
@@ -543,9 +543,9 @@ func (s *Server) collectionRowsQuery(u *user, colID string, flat []rowFilter, gr
 		}
 	}
 
-	s.db.QueryRow(`SELECT COUNT(*) FROM pages WHERE `+whereSQL, args...).Scan(&total)
+	s.readDB().QueryRow(`SELECT COUNT(*) FROM pages WHERE `+whereSQL, args...).Scan(&total)
 
-	rows, err := s.db.Query(`SELECT id, title, icon, cover, position, props, tags FROM pages WHERE `+whereSQL+` ORDER BY `+orderSQL+` LIMIT ? OFFSET ?`, append(args, limit, offset)...)
+	rows, err := s.readDB().Query(`SELECT id, title, icon, cover, position, props, tags FROM pages WHERE `+whereSQL+` ORDER BY `+orderSQL+` LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -580,7 +580,7 @@ func (s *Server) collectionRowsQuery(u *user, colID string, flat []rowFilter, gr
 	// connection. Anyone adding a `break` here keeps the cursor open and brings
 	// the whole server to a standstill.
 	var schemaJSON string
-	if s.db.QueryRow(`SELECT schema FROM collections WHERE page_id = ?`, colID).Scan(&schemaJSON) == nil {
+	if s.readDB().QueryRow(`SELECT schema FROM collections WHERE page_id = ?`, colID).Scan(&schemaJSON) == nil {
 		s.computeDerived(u, parseSchema(schemaJSON), list)
 	}
 	return list, total, nil

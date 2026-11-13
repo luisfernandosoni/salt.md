@@ -617,7 +617,7 @@ func (s *Server) handleOAuthRevoke(w http.ResponseWriter, r *http.Request) {
 // nil for anything else, so the caller can fall through to API tokens.
 func (s *Server) userForAccessToken(tok, ip string) *user {
 	var grantID, expires string
-	if s.db.QueryRow(`SELECT grant_id, expires_at FROM oauth_access WHERE token_hash = ?`, tokenHash(tok)).
+	if s.readDB().QueryRow(`SELECT grant_id, expires_at FROM oauth_access WHERE token_hash = ?`, tokenHash(tok)).
 		Scan(&grantID, &expires) != nil {
 		return nil
 	}
@@ -627,16 +627,20 @@ func (s *Server) userForAccessToken(tok, ip string) *user {
 		s.db.Exec(`DELETE FROM oauth_access WHERE token_hash = ?`, tokenHash(tok))
 		return nil
 	}
-	var userID, scope, workspaces string
-	if s.db.QueryRow(`SELECT user_id, scope, workspaces FROM oauth_grants WHERE id = ?`, grantID).
-		Scan(&userID, &scope, &workspaces) != nil {
+	var userID, scope, workspaces, prevAt, prevIP string
+	if s.readDB().QueryRow(`SELECT user_id, scope, workspaces, COALESCE(last_used_at, ''), COALESCE(last_used_ip, '') FROM oauth_grants WHERE id = ?`, grantID).
+		Scan(&userID, &scope, &workspaces, &prevAt, &prevIP) != nil {
 		return nil
 	}
 	u := s.userByID(userID)
 	if u == nil {
 		return nil
 	}
-	s.db.Exec(`UPDATE oauth_grants SET last_used_at = ?, last_used_ip = ? WHERE id = ?`, now(), ip, grantID)
+	// Same debounce as an API token, and the previous values came with the row:
+	// a grant used from the same address within the minute costs no write.
+	if shouldTouchToken(prevAt, prevIP, ip) {
+		s.db.Exec(`UPDATE oauth_grants SET last_used_at = ?, last_used_ip = ? WHERE id = ?`, now(), ip, grantID)
+	}
 	// The very same fields an API token sets. A grant is not a second permission
 	// model, it is another way to arrive at the one that exists — TokenScope
 	// being non-empty is what every existing gate already reads.
