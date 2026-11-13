@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createReactBlockSpec } from '@blocknote/react';
 import { Table2 } from 'lucide-react';
 import { useBlockCtx } from './blockContext';
@@ -529,17 +529,37 @@ export const mermaidSpec = createReactBlockSpec(
       const [editing, setEditing] = useState(!code);
       const [draft, setDraft] = useState(code);
       const [error, setError] = useState('');
+      // Read-only views cannot write the block, so the freshly drawn picture
+      // lives here instead. Also covers a source edit before it is persisted.
+      const [localSvg, setLocalSvg] = useState('');
+      const lastRendered = useRef<{ code: string; rev: number } | null>(
+        svg && rev === MERMAID_REV ? { code, rev } : null,
+      );
 
       // Re-drawn whenever the source changes, and the result written back to the
       // block. Guarded so a diagram that has not changed does not rewrite the
       // page on every mount — an edit is a real change to the document.
       useEffect(() => {
         let alive = true;
-        if (!code) return;
+        if (!code) {
+          setLocalSvg('');
+          lastRendered.current = null;
+          return;
+        }
+        // Stored SVG already matches this source and renderer generation, so
+        // there is nothing to draw and nothing to write.
+        const seen = lastRendered.current;
+        if (seen && seen.code === code && seen.rev === MERMAID_REV && (svg || localSvg)) return;
         void renderMermaid('mmd-' + block.id, code).then((r) => {
           if (!alive) return;
+          lastRendered.current = { code, rev: MERMAID_REV };
           setError(r.error);
-          if (r.svg && (r.svg !== svg || rev !== MERMAID_REV)) {
+          if (!r.svg) return;
+          if (!editor.isEditable) {
+            setLocalSvg(r.svg);
+            return;
+          }
+          if (r.svg !== svg || rev !== MERMAID_REV) {
             editor.updateBlock(block, { props: { svg: r.svg, rev: MERMAID_REV } } as never);
           }
         });
@@ -547,6 +567,9 @@ export const mermaidSpec = createReactBlockSpec(
           alive = false;
         };
       }, [code, rev]);
+
+      const displaySvg = localSvg || svg;
+      const isStale = !localSvg && stale;
 
       const save = () => {
         setEditing(false);
@@ -577,7 +600,7 @@ export const mermaidSpec = createReactBlockSpec(
               />
               <p className="bn-mermaid-hint">{t('Leave the box to draw it. Escape discards.')}</p>
             </div>
-          ) : svg && !error && !stale ? (
+          ) : displaySvg && !error && !isStale ? (
             // An <img>, not the SVG markup itself. This button lives inside
             // ProseMirror's DOM, and ProseMirror rebuilds a node view whenever
             // it likes — markup written into it (by React or by hand) was
@@ -595,7 +618,7 @@ export const mermaidSpec = createReactBlockSpec(
                 setEditing(true);
               }}
             >
-              <img src={svgDataURI(svg)} alt="" style={diagramSize(svg)} />
+              <img src={svgDataURI(displaySvg)} alt="" style={diagramSize(displaySvg)} />
             </button>
           ) : (
             <button
