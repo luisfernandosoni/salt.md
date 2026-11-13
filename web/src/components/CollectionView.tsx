@@ -262,7 +262,7 @@ export default function CollectionView({ collectionId, pages, tagColors, onNavig
       zIndex: 320,
     });
   }, [addViewOpen]);
-  const PAGE = 200;
+  const PAGE = 500;
 
   // Rows are fetched from the server (filtered/paginated there), NOT from the
   // global page list — a database can have tens of thousands of rows that must
