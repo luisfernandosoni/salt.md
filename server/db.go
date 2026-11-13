@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -347,13 +348,14 @@ func ensureColumn(db *sql.DB, table, column, ddl string) error {
 }
 
 func openDB(path string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-32768)&_pragma=mmap_size(134217728)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	// Single connection: one writer keeps SQLite trivially consistent and is
-	// more than fast enough for a personal/team workspace.
+	// more than fast enough for a personal/team workspace. openReadDB below is
+	// the other half of that decision, so reads do not queue here.
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -574,6 +576,34 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+// openReadDB opens a second, read-only pool for the same file.
+//
+// Server.db is one connection on purpose, so every reader in the process (a
+// page GET, a collection listing, a bearer token lookup, a collab join) queued
+// behind the writer. mode=ro and query_only mean a mistake in a read path can
+// never turn into a write, and the pool carries four connections because WAL
+// readers do not block each other.
+//
+// Returns nil for an in-memory database, where the reader pool would be a
+// different empty database, and whenever the file cannot be opened read-only.
+// readDB then falls back to the writer, which is slow but correct.
+func openReadDB(path string) *sql.DB {
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file::memory:") {
+		return nil
+	}
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(5000)&_pragma=cache_size(-32768)&_pragma=mmap_size(134217728)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil
+	}
+	db.SetMaxOpenConns(4)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil
+	}
+	return db
+}
 
 const welcomeContent = `[
  {"type":"paragraph","content":[{"type":"text","text":"Welcome to ","styles":{}},{"type":"text","text":"salt.md","styles":{"bold":true}},{"type":"text","text":": a fast, lightweight, open-source workspace for your notes, docs and ideas. 🧂","styles":{}}]},

@@ -140,7 +140,7 @@ func (s *Server) createSession(userID string) (string, error) {
 func (s *Server) userByID(id string) *user {
 	var u user
 	var isAdmin, disabled int
-	err := s.db.QueryRow(`SELECT u.id, u.email, u.name, u.color, u.avatar, u.is_admin, u.disabled, COALESCE(m.role, '')
+	err := s.readDB().QueryRow(`SELECT u.id, u.email, u.name, u.color, u.avatar, u.is_admin, u.disabled, COALESCE(m.role, '')
 		FROM users u LEFT JOIN org_members m ON m.user_id = u.id WHERE u.id = ?`, id).
 		Scan(&u.ID, &u.Email, &u.Name, &u.Color, &u.Avatar, &isAdmin, &disabled, &u.OrgRole)
 	if err != nil {
@@ -181,14 +181,13 @@ func (s *Server) currentUser(r *http.Request) *user {
 			return u
 		}
 		var userID, id, scope, wsScope string
-		err := s.db.QueryRow(`SELECT id, user_id, scope, workspace_scope FROM api_tokens WHERE token_hash = ?`, tokenHash(tok)).Scan(&id, &userID, &scope, &wsScope)
+		err := s.readDB().QueryRow(`SELECT id, user_id, scope, workspace_scope FROM api_tokens WHERE token_hash = ?`, tokenHash(tok)).Scan(&id, &userID, &scope, &wsScope)
 		if err == nil {
 			// WHERE it was used from, not just when. A token that travels in a URL
 			// (/mcp/{token}) cannot be kept secret — it sits in the connector's
 			// config, in Cloudflare's logs and in whatever proxy is between. What
 			// CAN be done is make a stranger using it obvious, and rotating cheap.
-			s.db.Exec(`UPDATE api_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ?`,
-				now(), s.clientIP(r), id)
+			s.touchAPIToken(id, s.clientIP(r))
 			u := s.userByID(userID)
 			if u != nil {
 				if scope != "read" {
@@ -218,7 +217,7 @@ func (s *Server) currentUser(r *http.Request) *user {
 		return nil
 	}
 	var userID, expires string
-	err := s.db.QueryRow(`SELECT user_id, expires_at FROM sessions WHERE token_hash = ?`, tokenHash(val)).Scan(&userID, &expires)
+	err := s.readDB().QueryRow(`SELECT user_id, expires_at FROM sessions WHERE token_hash = ?`, tokenHash(val)).Scan(&userID, &expires)
 	if err != nil {
 		return nil
 	}
@@ -227,6 +226,30 @@ func (s *Server) currentUser(r *http.Request) *user {
 		return nil
 	}
 	return s.userByID(userID)
+}
+
+// apiTokenTouchInterval is how often a token's last_used_* columns are allowed
+// to be rewritten for the same client address.
+const apiTokenTouchInterval = 60 * time.Second
+
+// touchAPIToken records when and where a bearer token was last used.
+//
+// This used to be an unconditional UPDATE on every bearer request, issued on the
+// single write connection. An agent makes hundreds of calls a minute and every
+// one of them queued behind the writer to change a column read at human
+// resolution. Same address inside the interval: nothing to write. A new address
+// is a fact worth recording at once, and so is the first use.
+func (s *Server) touchAPIToken(id, ip string) {
+	var prevAt, prevIP string
+	if err := s.readDB().QueryRow(`SELECT COALESCE(last_used_at, ''), last_used_ip FROM api_tokens WHERE id = ?`, id).Scan(&prevAt, &prevIP); err != nil {
+		return
+	}
+	if prevIP == ip && prevAt != "" {
+		if seen, err := time.Parse(time.RFC3339Nano, prevAt); err == nil && time.Since(seen) < apiTokenTouchInterval {
+			return
+		}
+	}
+	s.db.Exec(`UPDATE api_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ?`, now(), ip, id)
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {

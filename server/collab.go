@@ -434,7 +434,7 @@ func (s *Server) handleCollab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var exists int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pages WHERE id = ? AND trashed_at IS NULL`, pageID).Scan(&exists); err != nil || exists == 0 {
+	if err := s.readDB().QueryRow(`SELECT COUNT(*) FROM pages WHERE id = ? AND trashed_at IS NULL`, pageID).Scan(&exists); err != nil || exists == 0 {
 		httpError(w, 404, "page not found")
 		return
 	}
@@ -487,14 +487,14 @@ func (s *Server) handleCollab(w http.ResponseWriter, r *http.Request) {
 	}
 	var snapshot []byte
 	var stateSeq int64
-	haveState := s.db.QueryRow(`SELECT snapshot, seq FROM yjs_state WHERE page_id = ?`, pageID).Scan(&snapshot, &stateSeq) == nil
+	haveState := s.readDB().QueryRow(`SELECT snapshot, seq FROM yjs_state WHERE page_id = ?`, pageID).Scan(&snapshot, &stateSeq) == nil
 
 	type upd struct {
 		seq  int64
 		data []byte
 	}
 	var updates []upd
-	if rows, err := s.db.Query(`SELECT seq, data FROM yjs_updates WHERE page_id = ? ORDER BY seq`, pageID); err == nil {
+	if rows, err := s.readDB().Query(`SELECT seq, data FROM yjs_updates WHERE page_id = ? ORDER BY seq`, pageID); err == nil {
 		for rows.Next() {
 			var u upd
 			if rows.Scan(&u.seq, &u.data) == nil {

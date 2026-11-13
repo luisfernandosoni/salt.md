@@ -113,7 +113,7 @@ func (s *Server) handleListPages(w http.ResponseWriter, r *http.Request) {
 	//
 	// Trashed ones still come through, or a template in the bin could never be
 	// restored.
-	rows, err := s.db.Query(`WITH RECURSIVE tpl(id) AS (
+	rows, err := s.readDB().Query(`WITH RECURSIVE tpl(id) AS (
 			SELECT id FROM pages WHERE is_template = 1
 			UNION ALL
 			SELECT p.id FROM pages p JOIN tpl ON p.parent_id = tpl.id
@@ -159,7 +159,7 @@ func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
 	for i, v := range ws {
 		args[i] = v
 	}
-	rows, err := s.db.Query(`SELECT `+pageMetaCols+` FROM pages p
+	rows, err := s.readDB().Query(`SELECT `+pageMetaCols+` FROM pages p
 		WHERE workspace_id IN (`+placeholders(len(ws))+`)
 		AND is_template = 1 AND trashed_at IS NULL
 		ORDER BY title`, args...)
@@ -181,7 +181,7 @@ func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getPage(id string) (*page, error) {
-	row := s.db.QueryRow(`SELECT `+pageMetaCols+`, content, created_at, doc_gen FROM pages WHERE id = ?`, id)
+	row := s.readDB().QueryRow(`SELECT `+pageMetaCols+`, content, created_at, doc_gen FROM pages WHERE id = ?`, id)
 	var p page
 	var trashedAt sql.NullString
 	var content, props, tags string
@@ -245,7 +245,7 @@ func (s *Server) liveShared(ids []string) map[string]bool {
 			args = append(args, id)
 		}
 		args = append(args, now())
-		rows, err := s.db.Query(`SELECT DISTINCT page_id FROM share_links WHERE page_id IN (`+placeholders(len(chunk))+`)
+		rows, err := s.readDB().Query(`SELECT DISTINCT page_id FROM share_links WHERE page_id IN (`+placeholders(len(chunk))+`)
 			AND mode != 'form' AND (expires_at IS NULL OR expires_at = '' OR expires_at > ?)`, args...)
 		if err != nil {
 			return live
