@@ -49,7 +49,11 @@ const (
 	frameSnapshot  = 2
 
 	compactThreshold = 200
-	outBuffer        = 512
+	// Compacting on row count alone misses the room that holds two or three
+	// wide frames. A single large paste can put hundreds of kilobytes in a
+	// handful of rows, so every WebSocket open replays it.
+	compactBytesThreshold = 64 << 10
+	outBuffer             = 512
 	// wsReadLimit caps a single inbound WS frame. Must exceed a full-document
 	// snapshot (pushed on reconnect); 32 MiB is far above realistic docs yet
 	// still bounds memory a hostile client can force us to read.
@@ -260,16 +264,17 @@ func encodeAwarenessRemoval(aware map[uint64]uint64) []byte {
 type collabRoom struct {
 	pageID string
 
-	mu          sync.Mutex
-	conns       map[*collabConn]struct{}
-	loaded      bool
-	seq         int64
-	pending     int64
-	compacting  bool
-	compactConn *collabConn
-	epoch       int64
-	seeded      bool
-	seedConn    *collabConn
+	mu           sync.Mutex
+	conns        map[*collabConn]struct{}
+	loaded       bool
+	seq          int64
+	pending      int64
+	pendingBytes int64
+	compacting   bool
+	compactConn  *collabConn
+	epoch        int64
+	seeded       bool
+	seedConn     *collabConn
 }
 
 // broadcast enqueues a frame to every connection except `from`. Caller holds room.mu.
@@ -354,6 +359,7 @@ func (s *Server) resetYjsDoc(pageID string) {
 	room.loaded = false
 	room.seq = -1
 	room.pending = 0
+	room.pendingBytes = 0
 	room.compacting = false
 	room.compactConn = nil
 	room.seeded = false
@@ -506,7 +512,12 @@ func (s *Server) handleCollab(w http.ResponseWriter, r *http.Request) {
 		if len(updates) > 0 {
 			room.seq = updates[len(updates)-1].seq
 		}
+		var stored int64
+		for _, u := range updates {
+			stored += int64(len(u.data))
+		}
 		room.pending = int64(len(updates))
+		room.pendingBytes = stored
 		room.loaded = true
 	}
 
@@ -537,6 +548,15 @@ func (s *Server) handleCollab(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	conn.enqueue(outMsg{websocket.MessageText, []byte(`{"synced":true}`)})
+	// A room that is already over the line asks as soon as somebody who may
+	// write joins, so the history shrinks without waiting for the next edit.
+	if (room.pending >= compactThreshold || room.pendingBytes >= compactBytesThreshold) &&
+		!room.compacting && room.seq > 0 && s.canWriteReq(r, pageID) {
+		room.compacting = true
+		room.compactConn = conn
+		req, _ := json.Marshal(map[string]int64{"snapshotRequest": room.seq})
+		conn.enqueue(outMsg{websocket.MessageText, req})
+	}
 	room.mu.Unlock()
 
 	defer s.collab.leave(conn, room)
@@ -610,9 +630,10 @@ func (s *Server) persistUpdate(ctx context.Context, room *collabRoom, conn *coll
 		return
 	}
 	room.pending++
+	room.pendingBytes += int64(len(payload))
 	room.broadcastLocked(conn, outMsg{websocket.MessageBinary, data})
 
-	if room.pending >= compactThreshold && !room.compacting {
+	if (room.pending >= compactThreshold || room.pendingBytes >= compactBytesThreshold) && !room.compacting {
 		room.compacting = true
 		room.compactConn = conn
 		req, _ := json.Marshal(map[string]int64{"snapshotRequest": seq})
@@ -645,9 +666,10 @@ func (s *Server) applySnapshot(room *collabRoom, conn *collabConn, data []byte) 
 	}
 	s.db.Exec(`DELETE FROM yjs_updates WHERE page_id = ? AND seq <= ?`, room.pageID, upTo)
 	// Log rows added during the round-trip (seq > upTo) remain pending.
-	var remaining int64
-	s.db.QueryRow(`SELECT COUNT(*) FROM yjs_updates WHERE page_id = ?`, room.pageID).Scan(&remaining)
+	var remaining, remainingBytes int64
+	s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM yjs_updates WHERE page_id = ?`, room.pageID).Scan(&remaining, &remainingBytes)
 	room.pending = remaining
+	room.pendingBytes = remainingBytes
 	room.compacting = false
 	room.compactConn = nil
 }
