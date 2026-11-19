@@ -162,7 +162,14 @@ func blockPlainText(blk mdBlock) string {
 // Runs in the same breath as reindexPage. The delete path needs nothing of its
 // own: page_chunks hangs off pages by foreign key, and chunks_fts is carried
 // along here (a virtual table knows no cascade).
-func (s *Server) reindexChunks(pageID, workspaceID, title string, content []byte, trashed bool) error {
+//
+// contextPrefix is what the page is, not what it says: "Directorio › Acme" for
+// a row, plus the cleaned property values. It goes into the INDEXED heading
+// column only — page_chunks.heading stays the real heading path the result
+// shows — so a query across what a row IS and what it CONTAINS meets in one
+// passage. A row whose paragraph never names its database was otherwise found
+// by neither word.
+func (s *Server) reindexChunks(pageID, workspaceID, title string, content []byte, contextPrefix string, trashed bool) error {
 	if _, err := s.db.Exec(`DELETE FROM chunks_fts WHERE chunk_id IN
 		(SELECT id FROM page_chunks WHERE page_id = ?)`, pageID); err != nil {
 		return err
@@ -191,8 +198,14 @@ func (s *Server) reindexChunks(pageID, workspaceID, title string, content []byte
 		// The title goes into every passage: otherwise a two-word German query
 		// finds nothing when one word is in the title and the other in the
 		// paragraph — i18n-ok: "Vertrag Kündigung" is the example that showed it.
+		// The context follows the same reasoning one level up: the database and
+		// the property values belong to every passage of the row.
+		idxHeading := c.Heading
+		if ctx := strings.TrimSpace(contextPrefix); ctx != "" {
+			idxHeading = strings.TrimSpace(ctx + " " + idxHeading)
+		}
 		if _, err := s.db.Exec(`INSERT INTO chunks_fts (chunk_id, title, heading, text) VALUES (?, ?, ?, ?)`,
-			id, ftsText(title), ftsText(c.Heading), ftsText(c.Text)); err != nil {
+			id, ftsText(title), ftsText(idxHeading), ftsText(c.Text)); err != nil {
 			return err
 		}
 	}
