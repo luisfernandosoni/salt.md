@@ -899,14 +899,28 @@ func (s *Server) mcpBatchSetProperties(caller *user, updates json.RawMessage) (s
 //
 // The wrap runs AFTER the name resolution above, so `{"tags": "Bug"}` on a
 // multiselect ends up as ["bug"] and not ["Bug"].
-func (s *Server) normalizePropValues(pageID string, patch map[string]json.RawMessage) {
+func (s *Server) normalizePropValues(pageID string, patch map[string]json.RawMessage) error {
+	// Canonical keys first. mcpSetProperties has already done this, but the
+	// function is also the single normalization point for anything else that
+	// writes properties later, and a key that cannot be a property id has no
+	// business reaching storage at all.
+	for k := range patch {
+		key := cleanPropKey(k)
+		if !safePropID(key) {
+			return fmt.Errorf("%s", propKeyError(k))
+		}
+		if key != k {
+			patch[key] = patch[k]
+			delete(patch, k)
+		}
+	}
 	var parentID string
 	if err := s.db.QueryRow(`SELECT COALESCE(parent_id, '') FROM pages WHERE id = ?`, pageID).Scan(&parentID); err != nil || parentID == "" {
-		return
+		return nil
 	}
 	schema, _, err := s.loadCollection(parentID)
 	if err != nil {
-		return
+		return nil
 	}
 	byProp := map[string]map[string]string{} // propID -> lowercased name or id -> id
 	listShaped := map[string]bool{}
@@ -978,6 +992,7 @@ func (s *Server) normalizePropValues(pageID string, patch map[string]json.RawMes
 		}
 		patch[prop] = raw
 	}
+	return nil
 }
 
 // resolveFilterValues maps filter values written as an option NAME onto the id

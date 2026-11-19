@@ -295,7 +295,7 @@
           "waitFor": ".sidebar"
         },
         {
-          "press": "Meta+k"
+          "press": "ControlOrMeta+k"
         },
         {
           "wait": 400
@@ -312,7 +312,7 @@
       ],
       "takenAt": {
         "web/src/components/SearchModal.tsx": "b0222524b0ce",
-        "server/searchindex.go": "f47d847a92ad",
+        "server/searchindex.go": "430d96dd15f3",
         "web/src/theme.css": "6a5de72d7e2c"
       }
     },
@@ -634,7 +634,7 @@
       ],
       "takenAt": {
         "web/src/components/AgentConnect.tsx": "dd2865c640de",
-        "server/mcp.go": "f25b6d77d65a",
+        "server/mcp.go": "f4ec7081fc74",
         "web/src/theme.css": "6a5de72d7e2c"
       },
       "element": ".dialog"

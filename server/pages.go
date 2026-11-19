@@ -465,6 +465,23 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, "invalid JSON")
 		return
 	}
+	// Property keys are canonicalised wherever they are written (see
+	// cleanPropKey). A quoted spelling is healed; a key that cannot be a
+	// property id is refused here, before a transaction is opened, so the
+	// answer says 400 rather than leaving a half-written row behind.
+	if len(body.PropsPatch) > 0 {
+		var patch map[string]json.RawMessage
+		if err := json.Unmarshal(body.PropsPatch, &patch); err != nil {
+			httpError(w, 400, "propsPatch must be a JSON object")
+			return
+		}
+		for k := range patch {
+			if !safePropID(cleanPropKey(k)) {
+				httpError(w, 400, propKeyError(k))
+				return
+			}
+		}
+	}
 	// The editor writing back its own copy of the live document, as opposed to
 	// a write that replaces it.
 	materialize := r.URL.Query().Get("materialize") == "1"
@@ -648,11 +665,18 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal([]byte(current), &merged)
 		before := map[string]json.RawMessage{}
 		json.Unmarshal([]byte(current), &before)
+		// Canonical keys: the same patch the check above accepted, and the
+		// legacy quoted twin removed, so a row cannot end up with the value on
+		// one spelling and the card reading the other.
+		cleanPatch := make(map[string]json.RawMessage, len(patch))
 		for k, v := range patch {
+			key := cleanPropKey(k)
+			delete(merged, `"`+key+`"`)
+			cleanPatch[key] = v
 			if string(v) == "null" {
-				delete(merged, k)
+				delete(merged, key)
 			} else {
-				merged[k] = v
+				merged[key] = v
 			}
 		}
 		mergedJSON, err := json.Marshal(merged)
@@ -663,7 +687,7 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 		sets = append(sets, "props = ?")
 		args = append(args, string(mergedJSON))
 		metaChanged = true
-		for k := range patch {
+		for k := range cleanPatch {
 			changedProps = append(changedProps, k)
 		}
 
@@ -678,7 +702,7 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 		// It also means the log finally covers the ordinary case — somebody
 		// moves a card on a board — and that a change made in the browser can
 		// be taken back the same way an agent's can.
-		if diff := propsDiff(before, patch); len(diff) > 0 {
+		if diff := propsDiff(before, cleanPatch); len(diff) > 0 {
 			if b, err := json.Marshal(diff); err == nil {
 				auditProps = string(b)
 			}
@@ -900,16 +924,20 @@ func (s *Server) reindexPage(id string) error {
 	if trashedAt.Valid {
 		// In the trash: clear the passages, or the page keeps turning up in
 		// the passage-based search.
-		s.reindexChunks(id, "", "", nil, true)
+		s.reindexChunks(id, "", "", nil, "", true)
 		return nil
 	}
 	// Refresh the notes-list preview (snippet + first image) alongside the index.
 	sn, th := extractSnippetAndThumb([]byte(content))
 	s.db.Exec(`UPDATE pages SET snippet = ?, thumb = ? WHERE id = ?`, sn, th, id)
 	body := extractText([]byte(content))
+	propsText := ""
 	var props string
 	if s.db.QueryRow(`SELECT props FROM pages WHERE id = ?`, id).Scan(&props) == nil {
-		body += " " + extractPropsText([]byte(props))
+		propsText = extractPropsText([]byte(props))
+		if propsText != "" {
+			body += " " + propsText
+		}
 	}
 	// Attached file texts (e.g. extracted PDFs) are searchable under the page.
 	if rows, err := s.db.Query(`SELECT text FROM file_texts WHERE page_id = ?`, id); err == nil {
@@ -933,10 +961,48 @@ func (s *Server) reindexPage(id string) error {
 	// are the refinement.
 	var wsID string
 	s.db.QueryRow(`SELECT workspace_id FROM pages WHERE id = ?`, id).Scan(&wsID)
-	if err := s.reindexChunks(id, wsID, clean.Replace(title), []byte(content), false); err != nil {
+	ctx := s.pageContextPrefix(id, propsText)
+	if err := s.reindexChunks(id, wsID, clean.Replace(title), []byte(content), ctx, false); err != nil {
 		log.Printf("reindexChunks %s: %v", id, err)
 	}
 	return nil
+}
+
+// pageContextPrefix is what the page IS, for the passage index: the breadcrumb
+// of its ancestors ("Directorio › Acme") followed by the readable property text.
+//
+// A row of a database says "Acme" and nothing else. Everything that makes it
+// findable — which database it lives in, what its fields hold — sits outside
+// its own content, so the passage of a row carried none of it and a query over
+// a property value reached the database and missed the row.
+//
+// A page with no ancestors inherits nothing and gets no context: its values
+// already sit in the whole-page index (reindexPage adds them to the body), and
+// inventing a passage for what the page is not would only rank it above pages
+// that actually say the word.
+func (s *Server) pageContextPrefix(id, propsText string) string {
+	var parts []string
+	next := id
+	// A page cannot be its own ancestor (the move path refuses the cycle), but
+	// the walk is bounded anyway: a corrupted parent chain must not hang the
+	// indexer.
+	for depth := 0; depth < 16; depth++ {
+		var parent sql.NullString
+		if err := s.db.QueryRow(`SELECT parent_id FROM pages WHERE id = ?`, next).Scan(&parent); err != nil || !parent.Valid || parent.String == "" {
+			break
+		}
+		next = parent.String
+		var title string
+		if err := s.db.QueryRow(`SELECT title FROM pages WHERE id = ?`, next).Scan(&title); err != nil {
+			break
+		}
+		parts = append([]string{strings.TrimSpace(title)}, parts...)
+	}
+	crumbs := strings.TrimSpace(strings.Join(parts, " › "))
+	if crumbs == "" {
+		return ""
+	}
+	return strings.TrimSpace(crumbs + " " + strings.TrimSpace(propsText))
 }
 
 func (s *Server) handleDeletePage(w http.ResponseWriter, r *http.Request) {
@@ -1141,6 +1207,10 @@ type searchResult struct {
 	// "Contract › Termination". Empty when the hit comes from the whole-page
 	// index or sits under no heading at all.
 	Heading string `json:"heading,omitempty"`
+	// Passage is the matching passage's full text, for the agent's "passages"
+	// detail. Not part of the browser's answer: it holds 700 characters where
+	// the excerpt holds fourteen words, and the list is rendered in a dropdown.
+	Passage string `json:"-"`
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -1204,7 +1274,7 @@ func (s *Server) searchChunks(userID, match string, ws []string, want int) []sea
 	for offset, round := 0, 0; len(out) < want && round < 8; round++ {
 		qArgs := append([]any{}, args...)
 		rows, err := s.db.Query(`
-			SELECT c.page_id, p.title, p.icon, c.heading,
+			SELECT c.page_id, p.title, p.icon, c.heading, c.text,
 			       snippet(chunks_fts, 3, char(1), char(2), '…', `+snippetTokens(match, 18)+`)
 			FROM chunks_fts
 			JOIN page_chunks c ON c.id = chunks_fts.chunk_id
@@ -1221,7 +1291,7 @@ func (s *Server) searchChunks(userID, match string, ws []string, want int) []sea
 		var cand []searchResult
 		for rows.Next() {
 			var res searchResult
-			if rows.Scan(&res.ID, &res.Title, &res.Icon, &res.Heading, &res.Snippet) == nil {
+			if rows.Scan(&res.ID, &res.Title, &res.Icon, &res.Heading, &res.Passage, &res.Snippet) == nil {
 				res.Snippet = readableSnippet(res.Snippet)
 				cand = append(cand, res)
 			}

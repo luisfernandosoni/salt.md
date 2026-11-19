@@ -32,7 +32,10 @@ func (s *Server) mcpGetSchema(pageID string) (string, error) {
 // compact JSON including computed rollup/formula values. flat and groups
 // combine as in collectionRowsQuery: "this AND (that OR those)". today is the
 // viewer's day for relative date words; zero falls back to the server's day.
-func (s *Server) mcpQueryRows(u *user, pageID string, flat []rowFilter, groups [][]rowFilter, sort string, limit, offset int, today time.Time) (string, error) {
+//
+// fields projects each row's property map down to the named ones. An agent
+// reading a 14-column table for one column otherwise pays for thirteen.
+func (s *Server) mcpQueryRows(u *user, pageID string, flat []rowFilter, groups [][]rowFilter, sort string, limit, offset int, today time.Time, fields []string) (string, error) {
 	var isCollection int
 	if s.db.QueryRow(`SELECT COUNT(*) FROM collections WHERE page_id = ?`, pageID).Scan(&isCollection); isCollection == 0 {
 		return "", fmt.Errorf("page %q is not a database", pageID)
@@ -55,12 +58,56 @@ func (s *Server) mcpQueryRows(u *user, pageID string, flat []rowFilter, groups [
 	if err != nil {
 		return "", err
 	}
+	if len(fields) > 0 {
+		projectRowFields(rows, fields)
+	}
 	out, err := json.Marshal(map[string]any{"rows": rows, "total": total, "offset": offset, "limit": limit})
 	if err != nil {
 		return "", err
 	}
 	// Row content is user data — mark it untrusted like get_page/search do.
 	return wrapUntrusted(string(out)), nil
+}
+
+// cleanPropKey canonicalises the spelling of a property id.
+//
+// The schema writes ids as ["a-z0-9_-"], but a value read back from JSON often
+// arrives with the outer quotes still on it ("\"status\""), and an agent that
+// copied the schema off a pretty-printed page writes exactly that. Stored as
+// its own key it becomes a second, invisible property: the board reads
+// "status", the twin holds the value, and nothing looks wrong until the chip
+// is blank. So the quotes come off, everywhere, on the way in.
+func cleanPropKey(k string) string { return strings.Trim(k, "\"") }
+
+// propKeyError is the refusal for a key that can never be a property id.
+func propKeyError(k string) string {
+	return fmt.Sprintf("property id %q is not valid: property ids use letters, digits, _ and - (got %q)", k, cleanPropKey(k))
+}
+
+// projectRowFields replaces each row's props with the named ones. Identity —
+// id, title, icon, position — is never projected away: a row without its id is
+// not a row, and an agent that cannot name what it just read cannot act on it.
+func projectRowFields(rows []map[string]any, fields []string) {
+	want := map[string]bool{}
+	for _, f := range fields {
+		if k := cleanPropKey(f); safePropID(k) {
+			want[k] = true
+		}
+	}
+	for _, row := range rows {
+		props, ok := row["props"].(map[string]any)
+		if !ok {
+			continue
+		}
+		kept := make(map[string]any, len(want))
+		for k, v := range props {
+			key := cleanPropKey(k)
+			if want[key] {
+				kept[key] = v
+			}
+		}
+		row["props"] = kept
+	}
 }
 
 // mcpSetProperties field-level-merges the given property values into a row's
@@ -73,11 +120,25 @@ func (s *Server) mcpSetProperties(pageID string, properties json.RawMessage, act
 	if err := json.Unmarshal(properties, &patch); err != nil {
 		return "", fmt.Errorf("properties must be a JSON object")
 	}
+	// Keys first: a quoted spelling is healed, an impossible one is refused
+	// before anything is written. Doing it here means create_rows and the
+	// batch form get the same treatment, since both end up in this function.
+	clean := make(map[string]json.RawMessage, len(patch))
+	for k, v := range patch {
+		key := cleanPropKey(k)
+		if !safePropID(key) {
+			return "", fmt.Errorf("%s", propKeyError(k))
+		}
+		clean[key] = v
+	}
+	patch = clean
 	// Map select values that arrive as a NAME onto the id, and wrap a single
 	// value written to a list-shaped property into a list.
 	// MUST come before tx.Begin(): the pool holds exactly ONE connection, so a
 	// query inside the open transaction would block forever.
-	s.normalizePropValues(pageID, patch)
+	if err := s.normalizePropValues(pageID, patch); err != nil {
+		return "", err
+	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -101,6 +162,9 @@ func (s *Server) mcpSetProperties(pageID string, properties json.RawMessage, act
 	diff := map[string]propChange{}
 	changed := make([]string, 0, len(patch))
 	for k, v := range patch {
+		// Writing the real key deletes the legacy quoted twin: the value lives
+		// in one place, and that place is the one everything reads.
+		delete(merged, `"`+k+`"`)
 		before := "null"
 		if prev, ok := merged[k]; ok {
 			before = string(prev)

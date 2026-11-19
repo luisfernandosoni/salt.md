@@ -37,7 +37,12 @@ import (
 
 // ftsVersion is the version this build expects. Raise it whenever the
 // tokenizer line or the column layout changes.
-const ftsVersion = "4"
+//
+// Version 5: the passages carry context. A row's breadcrumb (its database, its
+// parents) and its cleaned property values join the passage, so a query over
+// "directorio activo" reaches the row instead of the database only. That is a
+// change to what goes INTO chunks_fts, so the passages are rebuilt.
+const ftsVersion = "5"
 
 // cjkGap is what ftsText puts between two characters. The tokenizer splits on
 // anything that is no letter or digit, so a space would do for the index, but
@@ -120,6 +125,13 @@ func foldQuery(s string) string {
 // German endings that get cut off when searching — longest first.
 var germanSuffixes = []string{"ungen", "erin", "chen", "lein", "heit", "keit", "enen", "ern", "est", "end", "en", "er", "es", "em", "et", "e", "n", "s"}
 
+// Spanish endings. Longest first, and tried BEFORE the German ones: "ciones"
+// has to win over the German "es", or "aprobaciones" loses only two letters and
+// never reaches "aprobar". Spanish inflection is suffix-heavy in exactly the
+// places a search is asked about (approvals, due dates, meetings), so the stem
+// carries more of the recall than it does in German.
+var spanishSuffixes = []string{"ciones", "mientos", "idades", "cion", "miento", "idad", "mente", "ando", "iendo", "aron", "ieron", "aban", "adas", "ados", "idas", "idos", "es", "as", "os"}
+
 // stemLite cuts off a common ending so the prefix search can bite.
 //
 // The case it is about: "Verträge" folds to "vertrage". As the prefix
@@ -137,12 +149,77 @@ func stemLite(w string) string {
 	if len([]rune(w)) < 6 {
 		return w
 	}
-	for _, suf := range germanSuffixes {
-		if strings.HasSuffix(w, suf) && len([]rune(w))-len([]rune(suf)) >= 4 {
-			return strings.TrimSuffix(w, suf)
+	for _, list := range [][]string{spanishSuffixes, germanSuffixes} {
+		for _, suf := range list {
+			if strings.HasSuffix(w, suf) && len([]rune(w))-len([]rune(suf)) >= 4 {
+				return strings.TrimSuffix(w, suf)
+			}
 		}
 	}
 	return w
+}
+
+// searchStopwords are the words a question is made of rather than about. A
+// document does not have to contain them for the question to be about it:
+// "el informe para la junta" is answered by a page that says "Informe Junta".
+// Kept to the closed-class words of the three languages this instance serves
+// (Spanish, English, German) — every entry is a word nobody would search for
+// on its own.
+var searchStopwords = map[string]bool{
+	// Spanish
+	"de": true, "la": true, "el": true, "los": true, "las": true, "del": true,
+	"al": true, "en": true, "por": true, "para": true, "con": true, "sin": true,
+	"sobre": true, "como": true, "que": true, "un": true, "una": true,
+	"y": true, "o": true,
+	// English
+	"the": true, "of": true, "in": true, "for": true, "to": true, "and": true,
+	"or": true, "with": true, "on": true,
+	// German
+	"der": true, "die": true, "das": true, "und": true, "oder": true,
+	"mit": true, "von": true, "im": true, "den": true, "dem": true,
+}
+
+// contentTokens is the query with its stopwords dropped, folded the way the
+// index folds.
+func contentTokens(q string) []string {
+	var out []string
+	for _, tok := range strings.Fields(foldQuery(q)) {
+		if searchStopwords[tok] {
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
+// ftsMatchContentAND is the second tier: the same query with its stopwords
+// gone, still AND-joined.
+//
+// Only asked when the strict pattern found nothing, so nothing changes for a
+// query whose words are all on the page. "" means the tier declines — a query
+// of stopwords alone has nothing left to look for, and an empty MATCH pattern
+// is an error rather than a search.
+func ftsMatchContentAND(q string) string {
+	toks := contentTokens(q)
+	if len(toks) == 0 {
+		return ""
+	}
+	return matchTokens(toks, " AND ")
+}
+
+// ftsMatchRelaxedOR is the third and last tier: the content words OR-joined.
+//
+// Deliberately only in mcpSearch. An agent asking "factura conciliacion" is
+// usually describing a page it cannot name exactly, and a partial answer is
+// worth more than none; the browser's search keeps its AND promise, because a
+// human reading a result list needs to trust that both words are there (#107).
+// The caller still guards the count: one content word is no reason to OR.
+func ftsMatchRelaxedOR(q string) string {
+	toks := contentTokens(q)
+	if len(toks) < 2 {
+		return ""
+	}
+	return matchTokens(toks, " OR ")
 }
 
 // ftsMatch builds the MATCH pattern out of an input.
@@ -160,8 +237,14 @@ func stemLite(w string) string {
 // refusal reached the user as "no results" for most searches of two words
 // (#107).
 func ftsMatch(q string) string {
+	return matchTokens(strings.Fields(foldQuery(q)), " AND ")
+}
+
+// matchTokens is the one place the pattern is spelled, so the tiers can differ
+// in which words they take and how they join them — and in nothing else.
+func matchTokens(tokens []string, joiner string) string {
 	var groups []string
-	for _, raw := range strings.Fields(foldQuery(q)) {
+	for _, raw := range tokens {
 		seen := map[string]bool{}
 		var alts []string
 		add := func(t string) {
@@ -190,7 +273,7 @@ func ftsMatch(q string) string {
 			groups = append(groups, "("+strings.Join(alts, " OR ")+")")
 		}
 	}
-	return strings.Join(groups, " AND ")
+	return strings.Join(groups, joiner)
 }
 
 // migrateSearchIndex rebuilds the full-text index when it comes from an older

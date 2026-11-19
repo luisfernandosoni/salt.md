@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -688,23 +689,64 @@ func (s *Server) createDefaultCollection(pageID string) error {
 }
 
 // extractPropsText pulls indexable text out of a props object for FTS.
+//
+// Three things get through this door and no more. A key that cannot be a
+// property id is not one — it is a quoted spelling an agent wrote when it read
+// the schema wrong ("\"status\""), or a key no code path could ever write
+// ("bad$key") — so its value is not text this page has. A bare 32-character
+// hex string is a relation id, a page id or an option id: it would put a
+// meaningless token in the index and, worse, make one page findable by another
+// page's identifier. What is left is the value a human would read on the card.
 func extractPropsText(props []byte) string {
 	var m map[string]any
 	if json.Unmarshal(props, &m) != nil {
 		return ""
 	}
-	out := ""
-	for _, v := range m {
-		switch t := v.(type) {
+	// Sorted keys: the indexed text must not depend on map iteration order, or
+	// two identical pages hash differently and a diff looks like a change.
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	write := func(s string) {
+		s = strings.TrimSpace(strings.Trim(s, `"`))
+		if s == "" || isHex32(s) {
+			return
+		}
+		b.WriteString(s)
+		b.WriteString(" ")
+	}
+	for _, k := range keys {
+		if !safePropID(cleanPropKey(k)) {
+			continue
+		}
+		switch t := m[k].(type) {
 		case string:
-			out += t + " "
+			write(t)
 		case []any:
 			for _, item := range t {
 				if str, ok := item.(string); ok {
-					out += str + " "
+					write(str)
 				}
 			}
 		}
 	}
-	return out
+	return strings.TrimSpace(b.String())
+}
+
+// isHex32 reports a bare identifier: 32 lowercase hex characters, the shape
+// of every id this server hands out. Such a value is a relation, never prose,
+// and indexing it only makes pages findable by each other's ids.
+func isHex32(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
