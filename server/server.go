@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,20 @@ type Server struct {
 	// in every real build; set only by tests, whose receiver lives on an address
 	// safeDial refuses by design (see webhooks.go).
 	webhookTransport http.RoundTripper
+	// webhookMu guards webhookTimers: the page.updated deliveries that are
+	// waiting out their debounce window, keyed by hook id and page id.
+	webhookMu     sync.Mutex
+	webhookTimers map[string]*debouncedWebhook
+	// webhookDebounce is how long page.updated waits for another save of the
+	// same page; 0 delivers at once. SALT_WEBHOOK_DEBOUNCE_MS sets it.
+	webhookDebounce time.Duration
+	// webhookDebounceFixed records that the value was set on purpose (by the
+	// environment or a test), so the test-transport default of 0 does not
+	// override it.
+	webhookDebounceFixed bool
+	// webhookRetryDelay overrides the wait before a failed delivery's one
+	// retry. 0 means the default (see effectiveWebhookRetryDelay).
+	webhookRetryDelay time.Duration
 }
 
 // Close stops background maintenance and releases the database. Call on
@@ -72,6 +87,9 @@ func (s *Server) Close() error {
 	default:
 		close(s.stopCleanup)
 	}
+	// Any debounced delivery still waiting must not fire into a closed
+	// database. Stopping them here is what makes Close safe to call at all.
+	s.stopDebouncedWebhooks()
 	if s.rdb != nil {
 		s.rdb.Close()
 	}
@@ -146,6 +164,20 @@ func New(dataDir string, dist fs.FS) (*Server, error) {
 		sharePwRate: newRateLimiter(10, 5),
 		renewals:    map[string]oauthRenewal{},
 		stopCleanup: make(chan struct{}),
+		// A page saved six times in ten seconds is one delivery, carrying the
+		// last state (see webhooks.go). Fifteen seconds is longer than the gap
+		// between keystrokes an editor's autosave produces and shorter than the
+		// patience of anything reacting to it.
+		webhookTimers:   map[string]*debouncedWebhook{},
+		webhookDebounce: 15 * time.Second,
+	}
+	// SALT_WEBHOOK_DEBOUNCE_MS shapes page.updated: "0" turns the window off for
+	// a receiver that wants every save as it happens.
+	if v, ok := os.LookupEnv("SALT_WEBHOOK_DEBOUNCE_MS"); ok {
+		if ms, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && ms >= 0 {
+			s.webhookDebounce = time.Duration(ms) * time.Millisecond
+			s.webhookDebounceFixed = true
+		}
 	}
 	if err := s.seed(); err != nil {
 		return nil, err

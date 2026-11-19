@@ -84,6 +84,29 @@ func propKeyError(k string) string {
 	return fmt.Sprintf("property id %q is not valid: property ids use letters, digits, _ and - (got %q)", k, cleanPropKey(k))
 }
 
+// cleanPropPatch canonicalises a property patch: a quoted spelling is healed and
+// an impossible key is refused before anything is written.
+//
+// When ONE patch carries both spellings of the same key, the unquoted one wins.
+// Go's map iteration order is random, so "the last one written" was whichever
+// the runtime happened to visit second: one call stored the real value, the next
+// identical call stored the stale twin. The rule here does not depend on order —
+// a quoted key only writes where the canonical spelling is absent.
+func cleanPropPatch(patch map[string]json.RawMessage) (map[string]json.RawMessage, error) {
+	clean := make(map[string]json.RawMessage, len(patch))
+	for k, v := range patch {
+		key := cleanPropKey(k)
+		if !safePropID(key) {
+			return nil, fmt.Errorf("%s", propKeyError(k))
+		}
+		if _, taken := clean[key]; taken && k != key {
+			continue
+		}
+		clean[key] = v
+	}
+	return clean, nil
+}
+
 // projectRowFields replaces each row's props with the named ones. Identity —
 // id, title, icon, position — is never projected away: a row without its id is
 // not a row, and an agent that cannot name what it just read cannot act on it.
@@ -123,15 +146,10 @@ func (s *Server) mcpSetProperties(pageID string, properties json.RawMessage, act
 	// Keys first: a quoted spelling is healed, an impossible one is refused
 	// before anything is written. Doing it here means create_rows and the
 	// batch form get the same treatment, since both end up in this function.
-	clean := make(map[string]json.RawMessage, len(patch))
-	for k, v := range patch {
-		key := cleanPropKey(k)
-		if !safePropID(key) {
-			return "", fmt.Errorf("%s", propKeyError(k))
-		}
-		clean[key] = v
+	patch, err := cleanPropPatch(patch)
+	if err != nil {
+		return "", err
 	}
-	patch = clean
 	// Map select values that arrive as a NAME onto the id, and wrap a single
 	// value written to a list-shaped property into a list.
 	// MUST come before tx.Begin(): the pool holds exactly ONE connection, so a
@@ -393,6 +411,10 @@ func (s *Server) mcpMovePage(userID, pageID, parentID string) (string, error) {
 		if err := tx.Commit(); err != nil {
 			return "", err
 		}
+		// Its own breadcrumb changed too: the passages of both the page and
+		// everything below it name the old place.
+		s.reindexPage(pageID)
+		s.reindexDescendants(pageID)
 		s.pagesChanged()
 		s.rowChanged(pageID)
 		return fmt.Sprintf("Moved page %s to the top level", pageID), nil
@@ -414,6 +436,8 @@ func (s *Server) mcpMovePage(userID, pageID, parentID string) (string, error) {
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
+	s.reindexPage(pageID)
+	s.reindexDescendants(pageID)
 	s.pagesChanged()
 	s.rowChanged(pageID)
 	return fmt.Sprintf("Moved page %s under %s", pageID, parentID), nil

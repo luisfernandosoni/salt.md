@@ -92,6 +92,11 @@ func (s *Server) mcpUpdatePageMetaWith(pageID, title, icon, cover, description, 
 		return "", fmt.Errorf("page %q not found", pageID)
 	}
 	s.reindexPage(pageID)
+	// A rename changes the breadcrumb its children are indexed by, so their
+	// passages have to be rewritten too (see reindexDescendants).
+	if title != "" {
+		s.reindexDescendants(pageID)
+	}
 	s.pagesChanged()
 	// A row whose title/icon/cover changed is still a row: the board showing it
 	// has to redraw the card, and a receiver watching the database hears it —

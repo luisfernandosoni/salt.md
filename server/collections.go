@@ -709,6 +709,18 @@ func extractPropsText(props []byte) string {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	// A key and its quoted twin are ONE property that an agent wrote twice
+	// (`status` and `"status"`); indexing both put the value in the passage
+	// twice and made the same page rank as if it said it more insistently. The
+	// canonical spelling wins when both exist; a quoted key with no twin is
+	// still real text.
+	canonical := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		if key := cleanPropKey(k); key == k {
+			canonical[key] = true
+		}
+	}
+	seen := map[string]bool{}
 	var b strings.Builder
 	write := func(s string) {
 		s = strings.TrimSpace(strings.Trim(s, `"`))
@@ -719,9 +731,14 @@ func extractPropsText(props []byte) string {
 		b.WriteString(" ")
 	}
 	for _, k := range keys {
-		if !safePropID(cleanPropKey(k)) {
+		key := cleanPropKey(k)
+		if !safePropID(key) || seen[key] {
 			continue
 		}
+		if k != key && canonical[key] {
+			continue // the unquoted twin is indexed in its place
+		}
+		seen[key] = true
 		switch t := m[k].(type) {
 		case string:
 			write(t)
