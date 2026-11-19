@@ -866,6 +866,13 @@ func (s *Server) mcpBatchSetProperties(caller *user, updates json.RawMessage) (s
 		if !s.canWrite(caller.ID, u.PageID) || !s.credentialMayEnter(caller, s.pageWorkspace(u.PageID)) {
 			return "", fmt.Errorf("page %q not found (nothing was changed)", u.PageID)
 		}
+		// A trashed row is refused here too, for the same reason as a bad key:
+		// discovered per row, it let every earlier row land and then answered
+		// with an error that leaves a partial batch behind.
+		var trashed sql.NullString
+		if err := s.db.QueryRow(`SELECT trashed_at FROM pages WHERE id = ?`, u.PageID).Scan(&trashed); err != nil || trashed.Valid {
+			return "", fmt.Errorf("page %q not found (nothing was changed)", u.PageID)
+		}
 		if len(u.Properties) == 0 {
 			return "", fmt.Errorf("row %q has no properties (nothing was changed)", u.PageID)
 		}

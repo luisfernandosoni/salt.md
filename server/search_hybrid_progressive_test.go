@@ -714,6 +714,58 @@ func TestGetPageETagMovesOnBrowserMetaAndRowWrites(t *testing.T) {
 	}
 }
 
+// The newest child's updated_at alone was the whole child half of an etag, so
+// an OLDER row leaving the database (its updated_at was not the maximum) left
+// the fingerprint identical while the board it describes was one row smaller.
+func TestCollectionETagMovesWhenAnOlderRowLeaves(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "etag-older-row@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	col := s.makeCollection(t, ws, uid, "Cobranza", `[{"id":"estado","name":"Estado","type":"text"}]`)
+	older := s.makeRow(t, ws, uid, col, "Vieja", `{"estado":"Pagado"}`)
+	newest := s.makeRow(t, ws, uid, col, "Nueva", `{"estado":"Pendiente"}`)
+	// Make the order explicit: the row that leaves is NOT the latest one.
+	if _, err := s.db.Exec(`UPDATE pages SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?`, older); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE pages SET updated_at = '2026-01-01T00:00:00Z' WHERE id = ?`, newest); err != nil {
+		t.Fatal(err)
+	}
+	before := mustETag(t, s, u, col)
+
+	if rec := requestAs(t, s, cookie, "DELETE", "/api/pages/"+older, ""); rec.Code != 200 {
+		t.Fatalf("trash an older row: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	if got := mustETag(t, s, u, col); got == before {
+		t.Error("trashing an older row left the database's etag unchanged")
+	}
+}
+
+// A regular page's children are part of what reading that page shows, so its
+// etag has to move when one arrives or leaves. Only collections were counted.
+func TestPageETagMovesWhenASubpageArrivesOrLeaves(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "etag-subpage@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	parent := s.makePage(t, ws, uid, "", "Proyecto", `{}`)
+	first := mustETag(t, s, u, parent)
+
+	child := s.makePage(t, ws, uid, parent, "Acta", `{}`)
+	afterChild := mustETag(t, s, u, parent)
+	if afterChild == first {
+		t.Fatal("adding a subpage left the parent's etag unchanged")
+	}
+
+	if rec := requestAs(t, s, cookie, "DELETE", "/api/pages/"+child, ""); rec.Code != 200 {
+		t.Fatalf("trash the subpage: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	if got := mustETag(t, s, u, parent); got == afterChild {
+		t.Error("removing a subpage left the parent's etag unchanged")
+	}
+}
+
 // ---- under: the narrowing happens before the limit --------------------
 
 // Five pages outside the subtree, each matching the word more often than the one
@@ -921,6 +973,32 @@ func TestBatchSetPropertiesWritesNothingOnABadKey(t *testing.T) {
 	}
 }
 
+// A trashed row has to be refused before the first write, not discovered by the
+// per-row write that reaches it: row 1 used to land and the call then reported
+// an error, leaving a partial batch nobody can undo by hand.
+func TestBatchSetPropertiesWritesNothingWhenARowIsTrashed(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "batch-trashed@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	col := s.makeCollection(t, ws, uid, "Lote", `[{"id":"estado","name":"Estado","type":"text"}]`)
+	first := s.makeRow(t, ws, uid, col, "Uno", `{"estado":"Pendiente"}`)
+	second := s.makeRow(t, ws, uid, col, "Dos", `{"estado":"Pendiente"}`)
+	if _, err := s.db.Exec(`UPDATE pages SET trashed_at = ? WHERE id = ?`, now(), second); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := callTool(t, s, u, "set_properties", `{"updates":[
+		{"page_id":"`+first+`","properties":{"estado":"Listo"}},
+		{"page_id":"`+second+`","properties":{"estado":"Listo"}}]}`)
+	if err == nil {
+		t.Fatal("a batch naming a trashed row was accepted")
+	}
+	if got := s.propsOf(t, first)["estado"]; got != "Pendiente" {
+		t.Errorf("row 1 was written before the trashed row was found: %v", got)
+	}
+}
+
 // ---- breadcrumbs follow a rename -------------------------------------
 
 // A child's passage carries its ancestors' names. Renaming the parent used to
@@ -950,6 +1028,64 @@ func TestRenameRefreshesDescendantBreadcrumbs(t *testing.T) {
 	out = agentSearch(t, s, u, `{"query":"proyecto nuevo"}`)
 	if !strings.Contains(out, child) {
 		t.Errorf("the child still answers to the old breadcrumb:\n%s", out)
+	}
+}
+
+// A REST move changes the moved page's own breadcrumb, and it used to refresh
+// only its descendants: the page itself kept answering to the folder it left
+// until a full rebuild.
+func TestMoveReindexesTheMovedPagesBreadcrumb(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "move-breadcrumb@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	// Two folder names with no word in common, so a relaxed query cannot find
+	// the page through the folder it just left.
+	oldParent := s.makePage(t, ws, uid, "", "Deposito", `{}`)
+	newParent := s.makePage(t, ws, uid, "", "Bodega", `{}`)
+	page := s.makePage(t, ws, uid, oldParent, "Acta", `{}`)
+	body, _ := json.Marshal([]map[string]any{paragraph("Acuerdo firmado por las partes.")})
+	if _, err := s.db.Exec(`UPDATE pages SET content = ? WHERE id = ?`, string(body), page); err != nil {
+		t.Fatal(err)
+	}
+	s.reindexPage(page)
+
+	if out := agentSearch(t, s, u, `{"query":"deposito"}`); !strings.Contains(out, page) {
+		t.Fatalf("the page is not findable by its current folder before the move:\n%s", out)
+	}
+
+	if rec := requestAs(t, s, cookie, "PATCH", "/api/pages/"+page, `{"parentId":"`+newParent+`"}`); rec.Code != 200 {
+		t.Fatalf("move: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+
+	out := agentSearch(t, s, u, `{"query":"bodega"}`)
+	if !strings.Contains(out, page) {
+		t.Errorf("the moved page still answers to its old folder:\n%s", out)
+	}
+	if out := agentSearch(t, s, u, `{"query":"deposito"}`); strings.Contains(out, page) {
+		t.Errorf("the moved page is still findable under the folder it left:\n%s", out)
+	}
+}
+
+// A browser property edit reaches the row without passing through content or
+// props, and it used to skip the index: the card showed the new value and a
+// search for it found nothing until the next full rebuild.
+func TestPropsPatchReindexesThePage(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "props-patch-index@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	col := s.makeCollection(t, ws, uid, "Cobranza", `[{"id":"estado","name":"Estado","type":"text"}]`)
+	row := s.makeRow(t, ws, uid, col, "Cliente Uno", `{"estado":"Pendiente"}`)
+
+	if out := agentSearch(t, s, u, `{"query":"moroso"}`); strings.Contains(out, row) {
+		t.Fatalf("the row is already findable by a value it does not have:\n%s", out)
+	}
+	if rec := requestAs(t, s, cookie, "PATCH", "/api/pages/"+row, `{"propsPatch":{"estado":"Moroso"}}`); rec.Code != 200 {
+		t.Fatalf("propsPatch: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	if out := agentSearch(t, s, u, `{"query":"moroso"}`); !strings.Contains(out, row) {
+		t.Errorf("the edited property is not searchable:\n%s", out)
 	}
 }
 

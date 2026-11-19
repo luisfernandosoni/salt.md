@@ -780,6 +780,70 @@ func TestWebhookTrashCancelsThePendingUpdate(t *testing.T) {
 	}
 }
 
+// The cancellation cannot sit behind "does anybody subscribe to page.trashed?".
+// A hook that only watches page.updated leaves that target list empty, and the
+// early return used to skip the cancel, so the pending update was delivered
+// after the page was already gone.
+func TestWebhookTrashCancelsThePendingUpdateWithNoTrashedSubscriber(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "trash-only-update@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	pid := s.makePage(t, ws, uid, "", "Efimero", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "page.updated", "s") // no page.trashed subscriber
+	s.webhookDebounce = 400 * time.Millisecond
+	s.webhookDebounceFixed = true
+
+	s.fireWebhook("page.updated", pid)
+	time.Sleep(50 * time.Millisecond)
+	s.fireWebhook("page.trashed", pid)
+
+	if !sink.silent(700 * time.Millisecond) {
+		t.Error("the pending page.updated was delivered after the trash")
+	}
+}
+
+// The timer callback may reach the mutex after a cancel, a superseding save or
+// Close already removed its entry. It used to delete the entry only when it
+// still owned it and then deliver regardless, so the cancelled delivery went
+// out anyway. Holding the mutex here parks the callback exactly in that race.
+func TestWebhookStaleTimerDoesNotDeliver(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "stale-timer@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	pid := s.makePage(t, ws, uid, "", "Carrera", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "page.updated", "s")
+
+	targets := s.webhookTargets("page.updated")
+	if len(targets) != 1 {
+		t.Fatalf("found %d page.updated targets, want 1", len(targets))
+	}
+	payload, err := json.Marshal(map[string]any{"event": "page.updated"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := webhookKey(targets[0].id, pid)
+	s.scheduleDebouncedWebhook(targets[0], pid, payload, 50*time.Millisecond)
+
+	// The callback fires while this lock is held and waits for it, which is
+	// where a cancel in another goroutine meets it.
+	s.webhookMu.Lock()
+	time.Sleep(150 * time.Millisecond)
+	pending := s.webhookTimers[key]
+	if pending == nil {
+		s.webhookMu.Unlock()
+		t.Fatal("the timer removed its own entry before the cancel ran")
+	}
+	pending.timer.Stop() // already fired: this is the cancel's no-op Stop
+	delete(s.webhookTimers, key)
+	s.webhookMu.Unlock()
+
+	if !sink.silent(500 * time.Millisecond) {
+		t.Error("a timer that no longer owned its entry delivered anyway")
+	}
+}
+
 // A 503 is the receiver saying "not now", so the delivery gets exactly one
 // second chance. Two attempts, and the recorded status is the last one.
 func TestWebhookRetriesA5xxOnce(t *testing.T) {
