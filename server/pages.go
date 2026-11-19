@@ -806,7 +806,7 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 		u := requestUser(r)
 		s.auditChanges("human", u.ID, u.Name, "set_properties", id, s.pageWorkspace(id), "", auditProps)
 	}
-	if body.Title != nil || len(body.Content) > 0 || len(body.Props) > 0 {
+	if body.Title != nil || len(body.Content) > 0 || len(body.Props) > 0 || len(body.ParentID) > 0 || len(body.PropsPatch) > 0 {
 		if err := s.reindexPage(id); err != nil {
 			httpError(w, 500, err.Error())
 			return
@@ -928,20 +928,21 @@ func (s *Server) handleReindexSiblings(w http.ResponseWriter, r *http.Request) {
 
 // pageETag is a short, deterministic fingerprint of everything a page read can
 // return: the row's updated_at (which every write path bumps), the body's length
-// and generation, the raw properties, and — for a database — the newest change
-// among its rows.
+// and generation, the raw properties, and what its children say — their count
+// and the newest change among them.
 //
 // It exists so a polling agent can pay for one line instead of a whole body. The
 // doc_gen it replaces only moved when the body was replaced from outside, so a
 // browser edit, a rename or a card moving on a board left the agent believing
-// its copy was current.
+// its copy was current. The count is here because the newest child's timestamp
+// alone hides an OLDER row leaving a database, and because every page lists its
+// subpages, not only a database.
 func (s *Server) pageETag(p *page) string {
+	var childCount int
 	maxChild := ""
-	if p.Type == "collection" {
-		s.db.QueryRow(`SELECT COALESCE(MAX(updated_at), '') FROM pages WHERE parent_id = ? AND trashed_at IS NULL`, p.ID).Scan(&maxChild)
-	}
+	s.db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM pages WHERE parent_id = ? AND trashed_at IS NULL`, p.ID).Scan(&childCount, &maxChild)
 	sum := sha256.Sum256([]byte(p.UpdatedAt + "|" + strconv.Itoa(len(p.Content)) + "|" +
-		strconv.FormatInt(p.DocGen, 10) + "|" + string(p.Props) + "|" + maxChild))
+		strconv.FormatInt(p.DocGen, 10) + "|" + string(p.Props) + "|" + strconv.Itoa(childCount) + "|" + maxChild))
 	return hex.EncodeToString(sum[:])[:16]
 }
 

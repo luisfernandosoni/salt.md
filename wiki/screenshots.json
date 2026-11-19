@@ -860,7 +860,7 @@
       ],
       "takenAt": {
         "web/src/components/AdminSettings.tsx": "6a57615c7d9c",
-        "server/webhooks.go": "eae1c580fc8f",
+        "server/webhooks.go": "7cef793e510f",
         "web/src/theme.css": "6a5de72d7e2c"
       },
       "element": ".dialog"

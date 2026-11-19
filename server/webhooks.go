@@ -174,6 +174,17 @@ func (s *Server) fireWebhook(event, pageID string) {
 	if !webhookEvents[event] {
 		return
 	}
+
+	// A page that is going away takes its pending update with it. Delivering
+	// page.updated AFTER page.trashed would describe a page the receiver has
+	// already been told is gone, in the wrong order, from a payload captured
+	// before the delete. This runs BEFORE the target check: when no hook
+	// subscribes to page.trashed the target list is empty, and returning there
+	// would leave the pending page.updated armed.
+	if event == "page.trashed" {
+		s.cancelDebouncedWebhooks(pageID)
+	}
+
 	targets := s.webhookTargets(event)
 	if len(targets) == 0 {
 		return
@@ -194,14 +205,6 @@ func (s *Server) fireWebhook(event, pageID string) {
 	})
 	if err != nil {
 		return
-	}
-
-	// A page that is going away takes its pending update with it. Delivering
-	// page.updated AFTER page.trashed would describe a page the receiver has
-	// already been told is gone, in the wrong order, from a payload captured
-	// before the delete.
-	if event == "page.trashed" {
-		s.cancelDebouncedWebhooks(pageID)
 	}
 
 	// Debounce only page.updated. The other five events describe one act each
@@ -265,22 +268,29 @@ func webhookKey(targetID, pageID string) string { return targetID + ":" + pageID
 func (s *Server) scheduleDebouncedWebhook(t webhookTarget, pageID string, payload []byte, wait time.Duration) {
 	key := webhookKey(t.id, pageID)
 	pending := &debouncedWebhook{target: t, payload: payload}
+	// The whole arming happens under the lock the callback takes: two saves
+	// racing could otherwise stop the newer timer and install the older one.
+	s.webhookMu.Lock()
+	defer s.webhookMu.Unlock()
 	pending.timer = time.AfterFunc(wait, func() {
 		s.webhookMu.Lock()
-		// Only the entry this timer owns may remove itself: a newer save may
-		// have replaced it after Stop and before this goroutine ran.
-		if s.webhookTimers[key] == pending {
+		// Only the entry this timer owns may remove itself, and only an entry
+		// still installed may deliver: a cancel, a superseding save or Close
+		// may have removed it while this goroutine waited for the lock.
+		owned := s.webhookTimers[key] == pending
+		if owned {
 			delete(s.webhookTimers, key)
 		}
 		s.webhookMu.Unlock()
+		if !owned {
+			return
+		}
 		s.deliverWebhook(t.id, t.url, t.secret, payload)
 	})
-	s.webhookMu.Lock()
 	if old := s.webhookTimers[key]; old != nil {
 		old.timer.Stop()
 	}
 	s.webhookTimers[key] = pending
-	s.webhookMu.Unlock()
 }
 
 // cancelDebouncedWebhooks drops every pending update for a page, whatever hooks
