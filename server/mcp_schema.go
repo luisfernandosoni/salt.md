@@ -852,15 +852,29 @@ func (s *Server) mcpBatchSetProperties(caller *user, updates json.RawMessage) (s
 	if len(list) > 200 {
 		return "", fmt.Errorf("at most 200 updates per call (got %d)", len(list))
 	}
-	// Check the permissions for ALL of them BEFORE the first change, or the
-	// call breaks off halfway and leaves a half-updated database. Every row
-	// passes both gates a single set_properties passes in mcpCall: the
-	// person's right to write, and the credential's. Without the second, a
+	// Check the permissions for ALL of them BEFORE the first change, and the
+	// properties too. The permission half was here; a bad property key on row 50
+	// of 60 used to be discovered halfway through the loop, so 49 rows were
+	// written and the call reported an error — an outcome nobody can act on
+	// without diffing the database by hand.
+	//
+	// Every row passes both gates a single set_properties passes in mcpCall:
+	// the person's right to write, and the credential's. Without the second, a
 	// token narrowed to one workspace wrote rows in the others, and an agent
 	// wrote into a workspace closed to agents, as long as it used this form.
 	for _, u := range list {
 		if !s.canWrite(caller.ID, u.PageID) || !s.credentialMayEnter(caller, s.pageWorkspace(u.PageID)) {
 			return "", fmt.Errorf("page %q not found (nothing was changed)", u.PageID)
+		}
+		if len(u.Properties) == 0 {
+			return "", fmt.Errorf("row %q has no properties (nothing was changed)", u.PageID)
+		}
+		var patch map[string]json.RawMessage
+		if err := json.Unmarshal(u.Properties, &patch); err != nil {
+			return "", fmt.Errorf("row %q: properties must be a JSON object (nothing was changed): %v", u.PageID, err)
+		}
+		if _, err := cleanPropPatch(patch); err != nil {
+			return "", fmt.Errorf("row %q: %v (nothing was changed)", u.PageID, err)
 		}
 	}
 	done := 0

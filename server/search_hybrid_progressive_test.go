@@ -306,28 +306,43 @@ func TestGetPageOutlineSectionAndLimits(t *testing.T) {
 		t.Error("max_chars returned the whole body")
 	}
 
-	// doc_gen 0 is a real generation: a fresh page must answer "unchanged"
-	// for a caller that already has 0, not fall through to the body.
-	p, err := s.getPage(id)
+	// The etag is the handle a poll sends back: one line instead of a body. It
+	// replaced doc_gen, which only moved when the body was replaced from
+	// OUTSIDE, so an edit in the browser looked unchanged.
+	full, err := callTool(t, s, u, "get_page", `{"page_id":"`+id+`"}`)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("get_page: %v", err)
 	}
-	if p.DocGen != 0 {
-		t.Fatalf("a page nobody rewrote from outside has doc_gen %d, want 0", p.DocGen)
+	etag := etagOf(t, full)
+	if etag == "" || len(etag) != 16 {
+		t.Fatalf("get_page carries no 16-hex [etag: ...] header:\n%s", full)
 	}
-	out, err = callTool(t, s, u, "get_page", `{"page_id":"`+id+`","if_none_match_docgen":0}`)
+	if !strings.Contains(full, "Plan de cobranza") {
+		t.Errorf("a different etag returned no body:\n%s", full)
+	}
+
+	out, err = callTool(t, s, u, "get_page", `{"page_id":"`+id+`","if_none_match":"`+etag+`"}`)
 	if err != nil {
-		t.Fatalf("if_none_match_docgen: %v", err)
+		t.Fatalf("if_none_match: %v", err)
 	}
-	if !strings.Contains(out, "Unchanged (doc_gen: 0)") {
-		t.Errorf("doc_gen 0 was treated as absent:\n%s", out)
+	if !strings.Contains(out, "Unchanged (etag: "+etag+")") {
+		t.Errorf("an unchanged page returned its body again:\n%s", out)
 	}
-	out, err = callTool(t, s, u, "get_page", `{"page_id":"`+id+`","if_none_match_docgen":9}`)
+	out, err = callTool(t, s, u, "get_page", `{"page_id":"`+id+`","if_none_match":"0000000000000000"}`)
 	if err != nil {
-		t.Fatalf("if_none_match_docgen stale: %v", err)
+		t.Fatalf("if_none_match stale: %v", err)
 	}
 	if !strings.Contains(out, "Plan de cobranza") {
-		t.Errorf("a different doc_gen returned no body:\n%s", out)
+		t.Errorf("a stale etag returned no body:\n%s", out)
+	}
+
+	// The outline carries the same handle.
+	out, err = callTool(t, s, u, "get_page", `{"page_id":"`+id+`","outline_only":true}`)
+	if err != nil {
+		t.Fatalf("outline etag: %v", err)
+	}
+	if got := etagOf(t, out); got == "" || got != etag {
+		t.Errorf("the outline's etag is %q, want the page's %q:\n%s", got, etag, out)
 	}
 
 	// The note trail keeps its last entries when notes_limit says so.
@@ -496,11 +511,14 @@ func TestListOmitsRowsAndCapsDepth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if !strings.Contains(out, "[2 rows]") {
+	if !strings.Contains(out, "[database · 2 rows]") {
 		t.Errorf("the database line says nothing about its rows:\n%s", out)
 	}
 	if strings.Contains(out, "Fila Acme") || strings.Contains(out, "Fila Beta") {
 		t.Errorf("include_rows=false still listed the rows:\n%s", out)
+	}
+	if !strings.Contains(out, "[database") {
+		t.Errorf("include_rows=false dropped the database marker:\n%s", out)
 	}
 	if !strings.Contains(out, "Manual") {
 		t.Errorf("include_rows=false dropped ordinary pages:\n%s", out)
@@ -588,13 +606,390 @@ func TestProgressiveDisclosureAddsNoToolNames(t *testing.T) {
 		props, _ := schema["properties"].(map[string]any)
 		for _, arg := range map[string][]string{
 			"search":     {"detail", "workspace_id", "under", "limit"},
-			"get_page":   {"outline_only", "section", "max_chars", "if_none_match_docgen", "notes_limit"},
+			"get_page":   {"outline_only", "section", "max_chars", "if_none_match", "notes_limit"},
 			"query_rows": {"fields"},
 			"list":       {"include_rows", "max_depth"},
 		}[name] {
 			if props[arg] == nil {
 				t.Errorf("%s does not declare the optional argument %q", name, arg)
 			}
+		}
+	}
+}
+
+// ---- etag: the handle a poll sends back ------------------------------
+
+// etagOf reads the [etag: <hex>] line out of a get_page answer.
+func etagOf(t *testing.T, out string) string {
+	t.Helper()
+	i := strings.Index(out, "[etag: ")
+	if i < 0 {
+		return ""
+	}
+	rest := out[i+len("[etag: "):]
+	j := strings.Index(rest, "]")
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:j])
+}
+
+// mustETag is etagOf over a fresh get_page, failing when the answer carries no
+// handle at all: a page nobody can poll cheaply is the bug this replaced.
+func mustETag(t *testing.T, s *Server, u *user, id string) string {
+	t.Helper()
+	out, err := callTool(t, s, u, "get_page", `{"page_id":"`+id+`"}`)
+	if err != nil {
+		t.Fatalf("get_page %s: %v", id, err)
+	}
+	tag := etagOf(t, out)
+	if tag == "" {
+		t.Fatalf("get_page %s carries no etag:\n%s", id, out)
+	}
+	return tag
+}
+
+// Every write path has to invalidate the etag, not only the one that replaces a
+// body from outside. The doc_gen it replaced moved on `write_content` alone, so
+// a browser save, a rename or a card moving left an agent's copy stale while the
+// tool answered "unchanged".
+func TestGetPageETagMovesOnBrowserMetaAndRowWrites(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "etag@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	id := s.makePage(t, ws, uid, "", "Cotizacion", `{}`)
+
+	first := mustETag(t, s, u, id)
+
+	// The editor's own save: PATCH ?materialize=1, which does NOT bump doc_gen.
+	// gen=0 is the generation the editor loaded.
+	rec := requestAs(t, s, cookie, "PATCH", "/api/pages/"+id+"?materialize=1&gen=0",
+		`{"content":[{"type":"paragraph","content":[{"type":"text","text":"Precio uno"}]}]}`)
+	if rec.Code != 200 {
+		t.Fatalf("browser save: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	afterBrowser := mustETag(t, s, u, id)
+	if afterBrowser == first {
+		t.Error("a browser save left the etag unchanged")
+	}
+	out, err := callTool(t, s, u, "get_page", `{"page_id":"`+id+`","if_none_match":"`+first+`"}`)
+	if err != nil {
+		t.Fatalf("stale if_none_match after a browser save: %v", err)
+	}
+	if strings.Contains(out, "Unchanged") {
+		t.Errorf("a stale etag was accepted after a browser save:\n%s", out)
+	}
+	if !strings.Contains(out, "Precio uno") {
+		t.Errorf("the stale read did not return the new body:\n%s", out)
+	}
+
+	// A rename.
+	if rec := requestAs(t, s, cookie, "PATCH", "/api/pages/"+id, `{"title":"Cotizacion final"}`); rec.Code != 200 {
+		t.Fatalf("rename: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	afterTitle := mustETag(t, s, u, id)
+	if afterTitle == afterBrowser {
+		t.Error("a rename left the etag unchanged")
+	}
+
+	// A property edit on the page itself.
+	if rec := requestAs(t, s, cookie, "PATCH", "/api/pages/"+id, `{"propsPatch":{"estado":"Activo"}}`); rec.Code != 200 {
+		t.Fatalf("props: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	if got := mustETag(t, s, u, id); got == afterTitle {
+		t.Error("a property edit left the etag unchanged")
+	}
+
+	// A card moving in a database leaves the DATABASE's body alone, and its
+	// etag has to move anyway: an agent watching a board watches the rows.
+	col := s.makeCollection(t, ws, uid, "Seguimiento", `[{"id":"estado","name":"Estado","type":"text"}]`)
+	rowID := s.makeRow(t, ws, uid, col, "Cliente", `{"estado":"Pendiente"}`)
+	colTag := mustETag(t, s, u, col)
+	if _, err := callTool(t, s, u, "set_properties", `{"page_id":"`+rowID+`","properties":{"estado":"Listo"}}`); err != nil {
+		t.Fatalf("set_properties: %v", err)
+	}
+	if got := mustETag(t, s, u, col); got == colTag {
+		t.Error("a row edit left the database's etag unchanged")
+	}
+}
+
+// ---- under: the narrowing happens before the limit --------------------
+
+// Five pages outside the subtree, each matching the word more often than the one
+// inside it, used to fill the limit; the post-filter then emptied the list and
+// the agent was told "No results." with a match sitting in the subtree.
+func TestSearchUnderFiltersBeforeTheLimit(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "under-limit@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+
+	root := s.makePage(t, ws, uid, "", "Carpeta", `{}`)
+	inside := s.makePage(t, ws, uid, root, "Factura interna", `{}`)
+
+	body := func(times int) string {
+		parts := make([]string, 0, times)
+		for i := 0; i < times; i++ {
+			parts = append(parts, "factura vencida factura")
+		}
+		b, _ := json.Marshal([]map[string]any{paragraph(strings.Join(parts, " "))})
+		return string(b)
+	}
+	outside := []string{}
+	for i := 0; i < 5; i++ {
+		id := s.makePage(t, ws, uid, "", fmt.Sprintf("Fuera %d", i), `{}`)
+		if _, err := s.db.Exec(`UPDATE pages SET content = ? WHERE id = ?`, body(5), id); err != nil {
+			t.Fatal(err)
+		}
+		s.reindexPage(id)
+		outside = append(outside, id)
+	}
+	if _, err := s.db.Exec(`UPDATE pages SET content = ? WHERE id = ?`, body(1), inside); err != nil {
+		t.Fatal(err)
+	}
+	s.reindexPage(inside)
+
+	out := agentSearch(t, s, u, `{"query":"factura","limit":3,"under":"`+root+`"}`)
+	if strings.Contains(out, "No results") {
+		t.Fatalf("under answered No results with a match inside the subtree:\n%s", out)
+	}
+	if !strings.Contains(out, inside) {
+		t.Errorf("the match inside the subtree is missing:\n%s", out)
+	}
+	for _, id := range outside {
+		if strings.Contains(out, id) {
+			t.Errorf("under returned a page outside the subtree:\n%s", out)
+		}
+	}
+	// The same query without `under` still reaches them, so the filter is what
+	// excluded them and not the index.
+	out = agentSearch(t, s, u, `{"query":"factura","limit":3}`)
+	if strings.Contains(out, "No results") {
+		t.Errorf("the unfiltered search found nothing:\n%s", out)
+	}
+}
+
+// ---- fenced code is not structure ------------------------------------
+
+// A `# comment` in a shell snippet is a shell comment. The outline used to list
+// it as an H1 and the section reader returned a slice of somebody's script.
+func TestOutlineAndSectionIgnoreHeadingsInsideFencedCode(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "fence@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	id := s.makePage(t, ws, uid, "", "Scripts", `{}`)
+
+	blocks := []map[string]any{
+		headingBlock(2, "Instalacion"),
+		paragraph("Paso uno."),
+		{
+			"type":    "codeBlock",
+			"props":   map[string]any{"language": "bash"},
+			"content": []map[string]any{{"type": "text", "text": "# comentario que no es un titulo\nset -e"}},
+		},
+		headingBlock(2, "Arranque"),
+		paragraph("Paso dos."),
+	}
+	raw, _ := json.Marshal(blocks)
+	if _, err := s.db.Exec(`UPDATE pages SET content = ? WHERE id = ?`, string(raw), id); err != nil {
+		t.Fatal(err)
+	}
+	s.reindexPage(id)
+
+	out, err := callTool(t, s, u, "get_page", `{"page_id":"`+id+`","outline_only":true}`)
+	if err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	if strings.Contains(out, "comentario que no es un titulo") {
+		t.Errorf("the outline reported a heading inside a code block:\n%s", out)
+	}
+	if !strings.Contains(out, "Instalacion") || !strings.Contains(out, "Arranque") {
+		t.Errorf("the outline lost a real heading:\n%s", out)
+	}
+
+	if _, err := callTool(t, s, u, "get_page", `{"page_id":"`+id+`","section":"comentario que no es un titulo"}`); err != nil {
+		t.Fatalf("section: %v", err)
+	}
+	out, err = callTool(t, s, u, "get_page", `{"page_id":"`+id+`","section":"comentario que no es un titulo"}`)
+	if err != nil {
+		t.Fatalf("section: %v", err)
+	}
+	if strings.Contains(out, "set -e") {
+		t.Errorf("a fenced line was treated as a heading:\n%s", out)
+	}
+
+	// Nor may a `~~~` block be treated differently from a ``` one.
+	md := "# Title\n\n```bash\n# not a heading\n```\n\n~~~\n## also not one\n~~~\n\n## Real\n\ntext\n"
+	code := codeLines(strings.Split(md, "\n"))
+	for i, line := range strings.Split(md, "\n") {
+		txt := strings.TrimSpace(line)
+		if (txt == "# not a heading" || txt == "## also not one") && !code[i] {
+			t.Errorf("%q should be inside a fence", line)
+		}
+	}
+	if _, found := sectionMarkdown(md, "not a heading"); found {
+		t.Error("sectionMarkdown accepted a heading inside a fence")
+	}
+	if _, found := sectionMarkdown(md, "also not one"); found {
+		t.Error("sectionMarkdown accepted a heading inside a ~~~ fence")
+	}
+	if _, found := sectionMarkdown(md, "Real"); !found {
+		t.Error("sectionMarkdown lost a real heading")
+	}
+}
+
+// ---- property text, twins and atomic batches -------------------------
+
+// An untitled ancestor used to make the whole context prefix empty, which
+// dropped the property text with it: the rows of an untitled database were
+// findable by their own words and by nothing that makes them findable.
+func TestPropertyTextSurvivesAnUntitledAncestor(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "untitled@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	col := s.makeCollection(t, ws, uid, "", `[{"id":"estado","name":"Estado","type":"text"}]`)
+	row := s.makeRow(t, ws, uid, col, "Cliente Uno", `{"estado":"Moroso"}`)
+	s.reindexPage(row)
+
+	out := agentSearch(t, s, u, `{"query":"moroso"}`)
+	if !strings.Contains(out, row) {
+		t.Errorf("the row of an untitled database is not findable by its property value:\n%s", out)
+	}
+}
+
+// A property written under both spellings is ONE value. The unquoted spelling
+// wins no matter which order Go visited the map in, and the index carries it
+// once.
+func TestTwinPropertySpellingsPreferTheUnquotedKey(t *testing.T) {
+	s := testServer(t)
+	uid, cookie := signedIn(t, s, "twins@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	col := s.makeCollection(t, ws, uid, "Estados", `[{"id":"estado","name":"Estado","type":"text"}]`)
+	row := s.makeRow(t, ws, uid, col, "Uno", `{}`)
+
+	for i := 0; i < 8; i++ {
+		args := `{"page_id":"` + row + `","properties":{"estado":"Real","\"estado\"":"Twin"}}`
+		if _, err := callTool(t, s, u, "set_properties", args); err != nil {
+			t.Fatalf("set_properties %d: %v", i, err)
+		}
+		if got := s.propsOf(t, row)["estado"]; got != "Real" {
+			t.Fatalf("iteration %d stored %v, want the unquoted value", i, got)
+		}
+	}
+	// The browser's propsPatch follows the same rule.
+	if rec := requestAs(t, s, cookie, "PATCH", "/api/pages/"+row,
+		`{"propsPatch":{"estado":"Directo","\"estado\"":"Twin"}}`); rec.Code != 200 {
+		t.Fatalf("propsPatch: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.propsOf(t, row)["estado"]; got != "Directo" {
+		t.Errorf("propsPatch stored %v, want the unquoted value", got)
+	}
+
+	text := extractPropsText([]byte(`{"status":"Activo","\"status\"":"Activo"}`))
+	if n := strings.Count(text, "Activo"); n != 1 {
+		t.Errorf("the twin was indexed %d times: %q", n, text)
+	}
+}
+
+// A bad property key on the last row of a batch has to leave every row alone.
+// It used to be discovered halfway through the loop, so the call wrote half the
+// database and answered with an error nobody can act on.
+func TestBatchSetPropertiesWritesNothingOnABadKey(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "batch@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	col := s.makeCollection(t, ws, uid, "Lote", `[{"id":"estado","name":"Estado","type":"text"}]`)
+	first := s.makeRow(t, ws, uid, col, "Uno", `{"estado":"Pendiente"}`)
+	second := s.makeRow(t, ws, uid, col, "Dos", `{"estado":"Pendiente"}`)
+
+	_, err := callTool(t, s, u, "set_properties", `{"updates":[
+		{"page_id":"`+first+`","properties":{"estado":"Listo"}},
+		{"page_id":"`+second+`","properties":{"bad$key":"x"}}]}`)
+	if err == nil {
+		t.Fatal("a batch with an invalid property key was accepted")
+	}
+	if got := s.propsOf(t, first)["estado"]; got != "Pendiente" {
+		t.Errorf("row 1 was written before the failure: %v", got)
+	}
+	if got := s.propsOf(t, second)["estado"]; got != "Pendiente" {
+		t.Errorf("row 2 changed despite the failure: %v", got)
+	}
+}
+
+// ---- breadcrumbs follow a rename -------------------------------------
+
+// A child's passage carries its ancestors' names. Renaming the parent used to
+// leave the child answering to the old breadcrumb until a full rebuild.
+func TestRenameRefreshesDescendantBreadcrumbs(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "breadcrumb@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	parent := s.makePage(t, ws, uid, "", "Proyecto viejo", `{}`)
+	child := s.makePage(t, ws, uid, parent, "Acta", `{}`)
+	body, _ := json.Marshal([]map[string]any{paragraph("Acuerdo firmado por las partes.")})
+	if _, err := s.db.Exec(`UPDATE pages SET content = ? WHERE id = ?`, string(body), child); err != nil {
+		t.Fatal(err)
+	}
+	s.reindexPage(child)
+
+	out := agentSearch(t, s, u, `{"query":"proyecto viejo"}`)
+	if !strings.Contains(out, child) {
+		t.Fatalf("the child is not findable by its ancestor's name:\n%s", out)
+	}
+
+	if _, err := callTool(t, s, u, "update_page", `{"page_id":"`+parent+`","title":"Proyecto nuevo"}`); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+
+	out = agentSearch(t, s, u, `{"query":"proyecto nuevo"}`)
+	if !strings.Contains(out, child) {
+		t.Errorf("the child still answers to the old breadcrumb:\n%s", out)
+	}
+}
+
+// ---- the two refusals and the word that decides the question ----------
+
+// "sin" carries the negation in Spanish, so it is a content word here: dropping
+// it as a stopword meant "factura sin pagar" reached the paid ones too.
+func TestSinIsAContentWord(t *testing.T) {
+	pattern := ftsMatchContentAND("factura sin pagar")
+	if pattern == "" {
+		t.Fatal("the content tier declined a query with three content words")
+	}
+	if !strings.Contains(pattern, "sin") {
+		t.Errorf("%s dropped \"sin\", which is what makes the query mean what it does", pattern)
+	}
+	if !strings.Contains(pattern, " AND ") {
+		t.Errorf("%s lost its AND join", pattern)
+	}
+	// The other preposition-like words are still stopwords.
+	if got := ftsMatchContentAND("el informe de la cuenta"); strings.Contains(got, `"el"*`) || strings.Contains(got, `"de"*`) {
+		t.Errorf("%s kept a stopword", got)
+	}
+}
+
+// Asking for the whole subtree AND one section of it is two answers. Honouring
+// one silently is how a caller ends up with the wrong half.
+func TestGetPageRefusesChildrenWithASectionOrOutline(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "two-answers@example.test")
+	u := &user{ID: uid, Name: "Test"}
+	ws := s.firstWorkspaceOf(t, uid)
+	id := s.makePage(t, ws, uid, "", "Padre", `{}`)
+
+	for _, args := range []string{
+		`{"page_id":"` + id + `","include_children":true,"outline_only":true}`,
+		`{"page_id":"` + id + `","include_children":true,"section":"Resumen"}`,
+		`{"page_id":"` + id + `","recursive":true,"outline_only":true}`,
+	} {
+		if _, err := callTool(t, s, u, "get_page", args); err == nil {
+			t.Errorf("%s was accepted, want a clear error", args)
 		}
 	}
 }

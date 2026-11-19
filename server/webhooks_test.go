@@ -230,7 +230,11 @@ func TestWebhookGuardIsInTheDeliveryPath(t *testing.T) {
 	s.db.Exec(`INSERT INTO webhooks (id, url, secret, events, active, created_at)
 		VALUES (?, ?, 's', 'page.updated', 1, ?)`, hookID, recv.URL, now())
 
-	// Deliberately NOT lending a transport: this is the production path.
+	// Deliberately NOT lending a transport: this is the production path. The
+	// debounce window is switched off so the attempt happens now — this test is
+	// about the SSRF guard, not about timing.
+	s.webhookDebounce = 0
+	s.webhookDebounceFixed = true
 	s.fireWebhook("page.updated", pid)
 	time.Sleep(500 * time.Millisecond)
 
@@ -709,5 +713,121 @@ func TestWebhookEventCatalogueMatchesTheDialog(t *testing.T) {
 	}
 	if len(webhookEvents) != 6 {
 		t.Errorf("there are %d webhook events, want 6", len(webhookEvents))
+	}
+}
+
+// --- debounce and the single retry ------------------------------------------
+
+// An agent saving six times in ten seconds used to produce six POSTs, five of
+// them describing a state that no longer existed by the time they arrived. The
+// window is one delivery, carrying the LAST save.
+func TestWebhookDebounceCoalescesSaves(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "debounce@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	pid := s.makePage(t, ws, uid, "", "Borrador", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "page.updated", "s")
+	// The test wants a window it can wait out, not the production fifteen
+	// seconds. hookFor lent the server a transport, which normally means "no
+	// window at all", so the value is marked as set on purpose.
+	s.webhookDebounce = 150 * time.Millisecond
+	s.webhookDebounceFixed = true
+
+	for _, title := range []string{"Primera", "Segunda", "Tercera"} {
+		if _, err := s.db.Exec(`UPDATE pages SET title = ? WHERE id = ?`, title, pid); err != nil {
+			t.Fatal(err)
+		}
+		s.fireWebhook("page.updated", pid)
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	c := sink.next(t, 3*time.Second)
+	p := sink.payload(t, c)
+	page, _ := p["page"].(map[string]any)
+	if page["title"] != "Tercera" {
+		t.Errorf("the delivery carries %v, want the latest save (Tercera)", page["title"])
+	}
+	if !sink.silent(400 * time.Millisecond) {
+		t.Error("the three saves produced more than one delivery")
+	}
+}
+
+// A page that is trashed inside the window must not also deliver the update that
+// was still waiting: the receiver would be told about a page it has already been
+// told is gone, out of order.
+func TestWebhookTrashCancelsThePendingUpdate(t *testing.T) {
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "trash-cancel@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	pid := s.makePage(t, ws, uid, "", "Efimero", `{}`)
+	sink := newHookSink()
+	hookFor(t, s, sink, "page.updated,page.trashed", "s")
+	s.webhookDebounce = 800 * time.Millisecond
+	s.webhookDebounceFixed = true
+
+	s.fireWebhook("page.updated", pid)
+	time.Sleep(50 * time.Millisecond)
+	s.fireWebhook("page.trashed", pid)
+
+	c := sink.next(t, 2*time.Second)
+	p := sink.payload(t, c)
+	if p["event"] != "page.trashed" {
+		t.Errorf("the first delivery is %v, want page.trashed", p["event"])
+	}
+	if !sink.silent(900 * time.Millisecond) {
+		t.Error("the cancelled page.updated was delivered anyway")
+	}
+}
+
+// A 503 is the receiver saying "not now", so the delivery gets exactly one
+// second chance. Two attempts, and the recorded status is the last one.
+func TestWebhookRetriesA5xxOnce(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	recv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer recv.Close()
+
+	s := testServer(t)
+	uid, _ := signedIn(t, s, "retry@example.test")
+	ws := s.firstWorkspaceOf(t, uid)
+	pid := s.makePage(t, ws, uid, "", "Reintento", `{}`)
+	hookID := newID()
+	s.webhookTransport = http.DefaultTransport
+	s.webhookRetryDelay = 20 * time.Millisecond
+	if _, err := s.db.Exec(`INSERT INTO webhooks (id, url, secret, events, active, created_at)
+		VALUES (?, ?, 's', 'page.updated', 1, ?)`, hookID, recv.URL, now()); err != nil {
+		t.Fatal(err)
+	}
+
+	s.fireWebhook("page.updated", pid)
+
+	deadline := time.Now().Add(3 * time.Second)
+	var status string
+	for {
+		s.db.QueryRow(`SELECT COALESCE(last_status,'') FROM webhooks WHERE id = ?`, hookID).Scan(&status)
+		if status == "HTTP 200" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status != "HTTP 200" {
+		t.Fatalf("last_status is %q, want HTTP 200 after the retry", status)
+	}
+	mu.Lock()
+	n := attempts
+	mu.Unlock()
+	if n != 2 {
+		t.Errorf("%d attempts, want exactly 2 (one retry, never a third)", n)
 	}
 }

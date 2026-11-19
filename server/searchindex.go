@@ -42,7 +42,14 @@ import (
 // parents) and its cleaned property values join the passage, so a query over
 // "directorio activo" reaches the row instead of the database only. That is a
 // change to what goes INTO chunks_fts, so the passages are rebuilt.
-const ftsVersion = "5"
+//
+// The "-soni" suffix namespaces this fork's index. The strict tier still writes
+// the same passages as upstream, but the stopword list below no longer drops
+// "sin": an instance whose questions are Spanish answers "factura sin pagar"
+// with pages that say exactly that, and a shared version number would let an
+// upstream start and this one disagree about what is in the index while both
+// believe they are at version 5.
+const ftsVersion = "5-soni"
 
 // cjkGap is what ftsText puts between two characters. The tokenizer splits on
 // anything that is no letter or digit, so a space would do for the index, but
@@ -165,10 +172,14 @@ func stemLite(w string) string {
 // Kept to the closed-class words of the three languages this instance serves
 // (Spanish, English, German) — every entry is a word nobody would search for
 // on its own.
+//
+// "sin" is NOT in the list, and that is deliberate: in Spanish it carries the
+// negation that decides which page answers the question ("factura sin pagar"
+// is not "factura pagada"), and dropping it made the query reach both.
 var searchStopwords = map[string]bool{
 	// Spanish
 	"de": true, "la": true, "el": true, "los": true, "las": true, "del": true,
-	"al": true, "en": true, "por": true, "para": true, "con": true, "sin": true,
+	"al": true, "en": true, "por": true, "para": true, "con": true,
 	"sobre": true, "como": true, "que": true, "un": true, "una": true,
 	"y": true, "o": true,
 	// English

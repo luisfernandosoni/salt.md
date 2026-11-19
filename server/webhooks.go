@@ -196,8 +196,115 @@ func (s *Server) fireWebhook(event, pageID string) {
 		return
 	}
 
+	// A page that is going away takes its pending update with it. Delivering
+	// page.updated AFTER page.trashed would describe a page the receiver has
+	// already been told is gone, in the wrong order, from a payload captured
+	// before the delete.
+	if event == "page.trashed" {
+		s.cancelDebouncedWebhooks(pageID)
+	}
+
+	// Debounce only page.updated. The other five events describe one act each
+	// (created, trashed, a row's field moving), and delaying them would make an
+	// integration react late to something that already happened once.
+	if event == "page.updated" {
+		if wait := s.effectiveWebhookDebounce(); wait > 0 {
+			for _, t := range targets {
+				s.scheduleDebouncedWebhook(t, pageID, payload, wait)
+			}
+			return
+		}
+	}
 	for _, t := range targets {
 		go s.deliverWebhook(t.id, t.url, t.secret, payload)
+	}
+}
+
+// debouncedWebhook is one page.updated waiting out its window: the timer that
+// will send it and the LATEST payload for that page. Keeping the payload is the
+// whole point — an agent that saves six times in ten seconds would otherwise
+// have the FIRST of the six delivered, describing a state that no longer exists.
+type debouncedWebhook struct {
+	timer   *time.Timer
+	target  webhookTarget
+	payload []byte
+}
+
+// effectiveWebhookDebounce is the window page.updated waits for another save of
+// the same page, in which the two become one delivery.
+//
+// A server that was handed a transport is a test: it wants the delivery, not the
+// window, unless the test set one on purpose (webhookDebounceFixed).
+func (s *Server) effectiveWebhookDebounce() time.Duration {
+	if s.webhookTransport != nil && !s.webhookDebounceFixed {
+		return 0
+	}
+	return s.webhookDebounce
+}
+
+// effectiveWebhookRetryDelay is how long a failed delivery waits before its one
+// retry. Five seconds against a real endpoint; fifty milliseconds in tests, so a
+// retry is provable without a test that takes five seconds.
+func (s *Server) effectiveWebhookRetryDelay() time.Duration {
+	if s.webhookRetryDelay > 0 {
+		return s.webhookRetryDelay
+	}
+	if s.webhookTransport != nil {
+		return 50 * time.Millisecond
+	}
+	return 5 * time.Second
+}
+
+// webhookKey names one pending delivery: a hook and the page it is about. The
+// pair, not the page alone, because two hooks subscribe to the same page and
+// each needs its own coalescing window.
+func webhookKey(targetID, pageID string) string { return targetID + ":" + pageID }
+
+// scheduleDebouncedWebhook arms (or re-arms) the window for one hook and page,
+// keeping the newest payload.
+func (s *Server) scheduleDebouncedWebhook(t webhookTarget, pageID string, payload []byte, wait time.Duration) {
+	key := webhookKey(t.id, pageID)
+	pending := &debouncedWebhook{target: t, payload: payload}
+	pending.timer = time.AfterFunc(wait, func() {
+		s.webhookMu.Lock()
+		// Only the entry this timer owns may remove itself: a newer save may
+		// have replaced it after Stop and before this goroutine ran.
+		if s.webhookTimers[key] == pending {
+			delete(s.webhookTimers, key)
+		}
+		s.webhookMu.Unlock()
+		s.deliverWebhook(t.id, t.url, t.secret, payload)
+	})
+	s.webhookMu.Lock()
+	if old := s.webhookTimers[key]; old != nil {
+		old.timer.Stop()
+	}
+	s.webhookTimers[key] = pending
+	s.webhookMu.Unlock()
+}
+
+// cancelDebouncedWebhooks drops every pending update for a page, whatever hooks
+// were waiting for it.
+func (s *Server) cancelDebouncedWebhooks(pageID string) {
+	suffix := ":" + pageID
+	s.webhookMu.Lock()
+	defer s.webhookMu.Unlock()
+	for key, pending := range s.webhookTimers {
+		if strings.HasSuffix(key, suffix) {
+			pending.timer.Stop()
+			delete(s.webhookTimers, key)
+		}
+	}
+}
+
+// stopDebouncedWebhooks stops every pending timer. Called from Close, or a
+// shutdown would leave timers firing into a closed database.
+func (s *Server) stopDebouncedWebhooks() {
+	s.webhookMu.Lock()
+	defer s.webhookMu.Unlock()
+	for key, pending := range s.webhookTimers {
+		pending.timer.Stop()
+		delete(s.webhookTimers, key)
 	}
 }
 
@@ -311,6 +418,9 @@ func (s *Server) fireRowWebhook(event, rowID string, changed []string) {
 	s.fireRowWebhookMeta(event, meta)
 }
 
+// deliverWebhook sends one event, retrying once when the failure can be
+// transient (a transport error, 429 or a 5xx). A 4xx is the receiver saying the
+// request itself is wrong; sending it again would only be noise.
 func (s *Server) deliverWebhook(id, target, secret string, payload []byte) {
 	defer func() {
 		// A panic in a background goroutine takes the whole server with it, and
@@ -320,14 +430,50 @@ func (s *Server) deliverWebhook(id, target, secret string, payload []byte) {
 		}
 	}()
 
+	status, err := s.postOnce(id, target, secret, payload)
+	// Record what the first attempt did before waiting for the retry: a
+	// delivery failing right now has to be visible to an admin right now, not
+	// five seconds from now.
+	s.recordAttempt(id, status, err)
+	if err != nil || status == http.StatusTooManyRequests || status >= 500 {
+		delay := s.effectiveWebhookRetryDelay()
+		if delay > 0 {
+			select {
+			case <-s.stopCleanup:
+				// Shutting down: no second attempt. The first one's outcome is
+				// what stays recorded.
+				return
+			case <-time.After(delay):
+				status, err = s.postOnce(id, target, secret, payload)
+				s.recordAttempt(id, status, err)
+			}
+		}
+	}
+}
+
+// recordAttempt writes one attempt's outcome to last_status. An HTTP status is
+// worth recording even when it is the one being retried: the next line replaces
+// it, and a success after a 503 reads as HTTP 200 — the final word.
+func (s *Server) recordAttempt(id string, status int, err error) {
+	if err != nil {
+		s.recordWebhookResult(id, "failed: "+truncate(err.Error(), 120))
+		return
+	}
+	s.recordWebhookResult(id, fmt.Sprintf("HTTP %d", status))
+}
+
+// postOnce sends one signed copy and reports its HTTP status, or the transport
+// error that stopped it. It builds the request itself so a retry starts from a
+// fresh body reader — reusing a spent one would send an empty payload that the
+// receiver's signature check (rightly) rejects.
+func (s *Server) postOnce(id, target, secret string, payload []byte) (int, error) {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(payload)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
 	req, err := http.NewRequest("POST", target, bytes.NewReader(payload))
 	if err != nil {
-		s.recordWebhookResult(id, "bad request: "+err.Error())
-		return
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "salt.md/"+Version)
@@ -359,11 +505,10 @@ func (s *Server) deliverWebhook(id, target, secret string, payload []byte) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		s.recordWebhookResult(id, "failed: "+truncate(err.Error(), 120))
-		return
+		return 0, err
 	}
 	defer resp.Body.Close()
-	s.recordWebhookResult(id, fmt.Sprintf("HTTP %d", resp.StatusCode))
+	return resp.StatusCode, nil
 }
 
 func (s *Server) recordWebhookResult(id, status string) {

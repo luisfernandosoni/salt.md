@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -418,6 +420,19 @@ func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
+// searchSubtreeSQL is the narrowing `search(under:)` applies, spelled once for
+// both indexes. It takes the id of the subtree's root as its single parameter
+// and needs no list of ids: 500 descendant ids would exceed SQLite's parameter
+// budget, and a temporary table would need a write connection the readers do
+// not have. The CTE is UNION, not UNION ALL, so a corrupted cycle terminates.
+const searchSubtreeSQL = ` AND %s IN (
+		WITH RECURSIVE sub(id) AS (
+			SELECT id FROM pages WHERE id = ?
+			UNION
+			SELECT p.id FROM pages p JOIN sub ON p.parent_id = sub.id
+		)
+		SELECT id FROM sub)`
+
 // validCover restricts covers to an empty value, a same-origin upload path, or
 // a plain linear/radial gradient. This blocks a stored external url() that
 // would otherwise fire a request (tracking beacon) for every viewer.
@@ -475,11 +490,9 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 			httpError(w, 400, "propsPatch must be a JSON object")
 			return
 		}
-		for k := range patch {
-			if !safePropID(cleanPropKey(k)) {
-				httpError(w, 400, propKeyError(k))
-				return
-			}
+		if _, err := cleanPropPatch(patch); err != nil {
+			httpError(w, 400, err.Error())
+			return
 		}
 	}
 	// The editor writing back its own copy of the live document, as opposed to
@@ -667,12 +680,15 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal([]byte(current), &before)
 		// Canonical keys: the same patch the check above accepted, and the
 		// legacy quoted twin removed, so a row cannot end up with the value on
-		// one spelling and the card reading the other.
-		cleanPatch := make(map[string]json.RawMessage, len(patch))
-		for k, v := range patch {
-			key := cleanPropKey(k)
+		// one spelling and the card reading the other. The unquoted spelling
+		// wins when both are in the patch (see cleanPropPatch).
+		cleanPatch, cerr := cleanPropPatch(patch)
+		if cerr != nil {
+			httpError(w, 400, cerr.Error())
+			return
+		}
+		for key, v := range cleanPatch {
 			delete(merged, `"`+key+`"`)
-			cleanPatch[key] = v
 			if string(v) == "null" {
 				delete(merged, key)
 			} else {
@@ -796,6 +812,11 @@ func (s *Server) handleUpdatePage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A rename or a move changes what the DESCENDANTS are findable by: their
+	// passages carry the breadcrumb of their ancestors. See reindexDescendants.
+	if body.Title != nil || len(body.ParentID) > 0 {
+		s.reindexDescendants(id)
+	}
 	// Content writes from outside the editor (API/MCP) invalidate the live
 	// CRDT doc; the editor's own materialization passes ?materialize=1.
 	if len(body.Content) > 0 && !materialize {
@@ -905,6 +926,57 @@ func (s *Server) handleReindexSiblings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]int{"reindexed": len(ids)})
 }
 
+// pageETag is a short, deterministic fingerprint of everything a page read can
+// return: the row's updated_at (which every write path bumps), the body's length
+// and generation, the raw properties, and — for a database — the newest change
+// among its rows.
+//
+// It exists so a polling agent can pay for one line instead of a whole body. The
+// doc_gen it replaces only moved when the body was replaced from outside, so a
+// browser edit, a rename or a card moving on a board left the agent believing
+// its copy was current.
+func (s *Server) pageETag(p *page) string {
+	maxChild := ""
+	if p.Type == "collection" {
+		s.db.QueryRow(`SELECT COALESCE(MAX(updated_at), '') FROM pages WHERE parent_id = ? AND trashed_at IS NULL`, p.ID).Scan(&maxChild)
+	}
+	sum := sha256.Sum256([]byte(p.UpdatedAt + "|" + strconv.Itoa(len(p.Content)) + "|" +
+		strconv.FormatInt(p.DocGen, 10) + "|" + string(p.Props) + "|" + maxChild))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// reindexDescendants refreshes the index of every page below rootID.
+//
+// A page's passage carries the breadcrumb of its ancestors (see
+// pageContextPrefix), so renaming a parent or moving a subtree changes what the
+// CHILDREN should be findable by. Reindexing only the page that was written left
+// the children answering to the name they no longer have.
+//
+// Bounded on purpose: a subtree of thousands is repaired by the next full
+// rebuild rather than making the write that triggered it take a minute.
+func (s *Server) reindexDescendants(rootID string) {
+	ids, err := subtreeIDs(s.db, rootID)
+	if err != nil {
+		log.Printf("reindex descendants of %s: %v", rootID, err)
+		return
+	}
+	const limit = 500
+	n := 0
+	for _, id := range ids {
+		if id == rootID {
+			continue
+		}
+		if n >= limit {
+			log.Printf("reindex descendants of %s: stopped after %d pages", rootID, limit)
+			return
+		}
+		if err := s.reindexPage(id); err != nil {
+			log.Printf("reindex descendant %s: %v", id, err)
+		}
+		n++
+	}
+}
+
 // reindexPage refreshes the full-text index for a single page.
 func (s *Server) reindexPage(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM pages_fts WHERE id = ?`, id); err != nil {
@@ -976,10 +1048,11 @@ func (s *Server) reindexPage(id string) error {
 // its own content, so the passage of a row carried none of it and a query over
 // a property value reached the database and missed the row.
 //
-// A page with no ancestors inherits nothing and gets no context: its values
-// already sit in the whole-page index (reindexPage adds them to the body), and
-// inventing a passage for what the page is not would only rank it above pages
-// that actually say the word.
+// A page with no ancestors inherits no breadcrumb at all: its values already sit
+// in the whole-page index, and inventing a passage for what the page is not would
+// only rank it above pages that actually say the word. A page whose ancestors
+// exist but were left untitled still keeps them as "Untitled" — otherwise the
+// empty breadcrumb took the property text down with it.
 func (s *Server) pageContextPrefix(id, propsText string) string {
 	var parts []string
 	next := id
@@ -996,10 +1069,20 @@ func (s *Server) pageContextPrefix(id, propsText string) string {
 		if err := s.db.QueryRow(`SELECT title FROM pages WHERE id = ?`, next).Scan(&title); err != nil {
 			break
 		}
-		parts = append([]string{strings.TrimSpace(title)}, parts...)
+		title = strings.TrimSpace(title)
+		if title == "" {
+			// An untitled ancestor is still part of where this page lives. An
+			// empty string here used to make the whole prefix empty — which
+			// dropped the property text with it, so the row of an untitled
+			// database was indexed by its own words and nothing else.
+			title = "Untitled"
+		}
+		parts = append([]string{title}, parts...)
 	}
 	crumbs := strings.TrimSpace(strings.Join(parts, " › "))
 	if crumbs == "" {
+		// No ancestors at all: nothing to say about where this page lives, and
+		// its values already sit in the whole-page index.
 		return ""
 	}
 	return strings.TrimSpace(crumbs + " " + strings.TrimSpace(propsText))
@@ -1246,7 +1329,15 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // many private pages belonging to other people — you got four results and
 // believed there were no more.
 func (s *Server) searchHits(userID, match string, ws []string, want int) []searchResult {
-	out := s.searchChunks(userID, match, ws, want)
+	return s.searchHitsFiltered(userID, match, ws, "", want)
+}
+
+// searchHitsFiltered is searchHits narrowed to the subtree of one page ("" for
+// no narrowing). The narrowing happens IN SQL, before LIMIT: filtering the
+// ranked hits afterwards let five pages outside the subtree fill the limit and
+// the caller was told "No results" while the subtree held a match.
+func (s *Server) searchHitsFiltered(userID, match string, ws []string, rootID string, want int) []searchResult {
+	out := s.searchChunksIn(userID, match, ws, rootID, want)
 	if len(out) >= want {
 		return out
 	}
@@ -1254,7 +1345,7 @@ func (s *Server) searchHits(userID, match string, ws []string, want int) []searc
 	for _, res := range out {
 		found[res.ID] = true
 	}
-	return append(out, s.searchWholePages(userID, match, ws, want-len(out), found)...)
+	return append(out, s.searchWholePagesIn(userID, match, ws, rootID, want-len(out), found)...)
 }
 
 // searchChunks searches the passages and returns the BEST one per page.
@@ -1264,12 +1355,21 @@ func (s *Server) searchHits(userID, match string, ws []string, want int) []searc
 // query. Since the rows arrive ranked anyway, the first hit per page is the
 // best one.
 func (s *Server) searchChunks(userID, match string, ws []string, want int) []searchResult {
+	return s.searchChunksIn(userID, match, ws, "", want)
+}
+
+func (s *Server) searchChunksIn(userID, match string, ws []string, rootID string, want int) []searchResult {
 	out := []searchResult{}
 	seen := map[string]bool{}
 	args := make([]any, 0, len(ws)+1)
 	args = append(args, match)
 	for _, v := range ws {
 		args = append(args, v)
+	}
+	narrow := ""
+	if rootID != "" {
+		narrow = fmt.Sprintf(searchSubtreeSQL, "c.page_id")
+		args = append(args, rootID)
 	}
 	for offset, round := 0, 0; len(out) < want && round < 8; round++ {
 		qArgs := append([]any{}, args...)
@@ -1280,9 +1380,10 @@ func (s *Server) searchChunks(userID, match string, ws []string, want int) []sea
 			JOIN page_chunks c ON c.id = chunks_fts.chunk_id
 			JOIN pages p ON p.id = c.page_id
 			WHERE chunks_fts MATCH ? AND p.trashed_at IS NULL
-			  AND c.workspace_id IN (`+placeholders(len(ws))+`)
+			  AND c.workspace_id IN (`+placeholders(len(ws))+`)`+narrow+`
 			ORDER BY bm25(chunks_fts, 0.0, 5.0, 3.0, 1.0)
 			LIMIT 60 OFFSET `+strconv.Itoa(offset), qArgs...)
+
 		if err != nil {
 			return out
 		}
@@ -1320,20 +1421,30 @@ func (s *Server) searchChunks(userID, match string, ws []string, want int) []sea
 // searchWholePages is the page-by-page search. Pages in skip are left out: the
 // passages already found them, with a better excerpt.
 func (s *Server) searchWholePages(userID, match string, ws []string, want int, skip map[string]bool) []searchResult {
+	return s.searchWholePagesIn(userID, match, ws, "", want, skip)
+}
+
+func (s *Server) searchWholePagesIn(userID, match string, ws []string, rootID string, want int, skip map[string]bool) []searchResult {
 	out := []searchResult{}
 	args := make([]any, 0, len(ws)+1)
 	args = append(args, match)
 	for _, v := range ws {
 		args = append(args, v)
 	}
+	narrow := ""
+	if rootID != "" {
+		narrow = fmt.Sprintf(searchSubtreeSQL, "p.id")
+		args = append(args, rootID)
+	}
 	for offset, round := 0, 0; len(out) < want && round < 8; round++ {
 		qArgs := append([]any{}, args...)
 		rows, err := s.db.Query(`
 			SELECT p.id, p.title, p.icon, snippet(pages_fts, 2, char(1), char(2), '…', `+snippetTokens(match, 14)+`)
 			FROM pages_fts JOIN pages p ON p.id = pages_fts.id
-			WHERE pages_fts MATCH ? AND p.trashed_at IS NULL AND p.workspace_id IN (`+placeholders(len(ws))+`)
+			WHERE pages_fts MATCH ? AND p.trashed_at IS NULL AND p.workspace_id IN (`+placeholders(len(ws))+`)`+narrow+`
 			ORDER BY bm25(pages_fts, 0.0, 5.0, 1.0)
 			LIMIT 60 OFFSET `+strconv.Itoa(offset), qArgs...)
+
 		if err != nil {
 			return out
 		}
